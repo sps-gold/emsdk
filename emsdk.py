@@ -143,6 +143,9 @@ BUILD_FOR_TESTING = False
 # Other valid values are 'ON' and 'OFF'
 ENABLE_LLVM_ASSERTIONS = 'auto'
 
+# If true, keeps the downloaded archive files.
+KEEP_DOWNLOADS = bool(os.getenv('EMSDK_KEEP_DOWNLOADS'))
+
 
 def os_name():
   if WINDOWS:
@@ -532,11 +535,7 @@ def run(cmd, cwd=None, quiet=False):
 
 
 # http://pythonicprose.blogspot.fi/2009/10/python-extract-targz-archive.html
-def untargz(source_filename, dest_dir, unpack_even_if_exists=False):
-  debug_print('untargz(source_filename=' + source_filename + ', dest_dir=' + dest_dir + ')')
-  if not unpack_even_if_exists and num_files_in_directory(dest_dir) > 0:
-    print("File '" + source_filename + "' has already been unpacked, skipping.")
-    return True
+def untargz(source_filename, dest_dir):
   print("Unpacking '" + source_filename + "' to '" + dest_dir + "'")
   mkdir_p(dest_dir)
   returncode = run(['tar', '-xvf' if VERBOSE else '-xf', sdk_path(source_filename), '--strip', '1'], cwd=dest_dir)
@@ -576,11 +575,7 @@ def move_with_overwrite(src, dest):
 
 
 # http://stackoverflow.com/questions/12886768/simple-way-to-unzip-file-in-python-on-all-oses
-def unzip(source_filename, dest_dir, unpack_even_if_exists=False):
-  debug_print('unzip(source_filename=' + source_filename + ', dest_dir=' + dest_dir + ')')
-  if not unpack_even_if_exists and num_files_in_directory(dest_dir) > 0:
-    print("File '" + source_filename + "' has already been unpacked, skipping.")
-    return True
+def unzip(source_filename, dest_dir):
   print("Unpacking '" + source_filename + "' to '" + dest_dir + "'")
   mkdir_p(dest_dir)
   common_subdir = None
@@ -1537,13 +1532,8 @@ def download_and_unzip(zipfile, dest_dir, download_even_if_exists=False,
   if not download_even_if_exists and num_files_in_directory(dest_dir) > 0:
     print("The contents of file '" + zipfile + "' already exist in destination '" + dest_dir + "', skipping.")
     return True
-  # Otherwise, if the archive must be downloaded, always write into the
-  # target directory, since it may be a new version of a tool that gets
-  # installed to the same place (that is, a different download name
-  # indicates different contents).
-  download_even_if_exists = True
 
-  received_download_target = download_file(url, zips_subdir, download_even_if_exists, filename_prefix)
+  received_download_target = download_file(url, zips_subdir, not KEEP_DOWNLOADS, filename_prefix)
   if not received_download_target:
     return False
   assert received_download_target == download_target
@@ -1554,9 +1544,9 @@ def download_and_unzip(zipfile, dest_dir, download_even_if_exists=False,
   if clobber:
     remove_tree(dest_dir)
   if zipfile.endswith('.zip'):
-    return unzip(download_target, dest_dir, unpack_even_if_exists=download_even_if_exists)
+    return unzip(download_target, dest_dir)
   else:
-    return untargz(download_target, dest_dir, unpack_even_if_exists=download_even_if_exists)
+    return untargz(download_target, dest_dir)
 
 
 def to_native_path(p):
@@ -2068,6 +2058,8 @@ class Tool(object):
     return True
 
   def cleanup_temp_install_files(self):
+    if KEEP_DOWNLOADS:
+        return
     url = self.download_url()
     if url.endswith(ARCHIVE_SUFFIXES):
       download_target = get_download_target(url, zips_subdir, getattr(self, 'zipfile_prefix', ''))
@@ -2733,7 +2725,7 @@ def construct_env_with_vars(env_vars_to_add):
   # if no such tool is active.
   # Ignore certain keys that are inputs to emsdk itself.
   ignore_keys = set(['EMSDK_POWERSHELL', 'EMSDK_CSH', 'EMSDK_CMD', 'EMSDK_BASH',
-                     'EMSDK_NUM_CORES', 'EMSDK_TTY'])
+                     'EMSDK_NUM_CORES', 'EMSDK_NOTTY', 'EMSDK_KEEP_DOWNLOADS'])
   env_keys_to_add = set(pair[0] for pair in env_vars_to_add)
   for key in os.environ:
     if key.startswith('EMSDK_') or key.startswith('EM_'):
@@ -2934,7 +2926,15 @@ def main(args):
        be sure to match the same --build= option to both 'install' and
        'activate' commands and the invocation of 'emsdk_env', or otherwise
        these commands will default to operating on the default build type
-       which in and RelWithDebInfo.''')
+       which is RelWithDebInfo.''')
+
+    print('''
+
+   Environment:
+      EMSDK_KEEP_DOWNLOADS=1     - if you want to keep the downloaded archives.
+      EMSDK_NOTTY=1              - override isatty() result (mainly to log progress).
+      EMSDK_NUM_CORES=n          - limit parallelism to n cores.
+      EMSDK_VERBOSE=1            - very verbose output, useful for debugging.''')
     return 0
 
   # Extracts a boolean command line argument from args and returns True if it was present
@@ -3186,7 +3186,7 @@ def main(args):
       errlog('No tools/SDKs found to activate! Usage:\n   emsdk activate tool/sdk1 [tool/sdk2] [...]')
       return 1
     if WINDOWS and not arg_permanent:
-      errlog('The changes made to environment variables only apply to the currently running shell instance. Use the \'emsdk_env.bat\' to re-enter this environment later, or if you\'d like to permanently register this environment permanently, rerun this command with the option --permanent.')
+      errlog('The changes made to environment variables only apply to the currently running shell instance. Use the \'emsdk_env.bat\' to re-enter this environment later, or if you\'d like to register this environment permanently, rerun this command with the option --permanent.')
     return 0
   elif cmd == 'install':
     global BUILD_FOR_TESTING, ENABLE_LLVM_ASSERTIONS, CPU_CORES, GIT_CLONE_SHALLOW
