@@ -58,35 +58,52 @@ extra_release_tag = None
 VERBOSE = int(os.getenv('EMSDK_VERBOSE', '0'))
 TTY_OUTPUT = not os.getenv('EMSDK_NOTTY', not sys.stdout.isatty())
 
-WINDOWS = False
-if os.name == 'nt' or (os.getenv('SYSTEMROOT') is not None and 'windows' in os.getenv('SYSTEMROOT').lower()) or (os.getenv('COMSPEC') is not None and 'windows' in os.getenv('COMSPEC').lower()):
-  WINDOWS = True
-
 
 def errlog(msg):
   print(msg, file=sys.stderr)
 
 
+def exit_with_error(msg):
+  errlog('error: %s' % msg)
+  sys.exit(1)
+
+
+WINDOWS = False
 MINGW = False
 MSYS = False
-if os.getenv('MSYSTEM'):
-  MSYS = True
-  # Some functions like os.path.normpath() exhibit different behavior between
-  # different versions of Python, so we need to distinguish between the MinGW
-  # and MSYS versions of Python
-  if sysconfig.get_platform() == 'mingw':
-    MINGW = True
-  if os.getenv('MSYSTEM') != 'MSYS' and os.getenv('MSYSTEM') != 'MINGW64':
-    # https://stackoverflow.com/questions/37460073/msys-vs-mingw-internal-environment-variables
-    errlog('Warning: MSYSTEM environment variable is present, and is set to "' + os.getenv('MSYSTEM') + '". This shell has not been tested with emsdk and may not work.')
-
 MACOS = False
-if platform.mac_ver()[0] != '':
-  MACOS = True
-
 LINUX = False
-if not MACOS and (platform.system() == 'Linux'):
-  LINUX = True
+
+if 'EMSDK_OS' in os.environ:
+  EMSDK_OS = os.environ['EMSDK_OS']
+  if EMSDK_OS == 'windows':
+    WINDOWS = True
+  elif EMSDK_OS == 'linux':
+    LINUX = True
+  elif EMSDK_OS == 'macos':
+    MACOS = True
+  else:
+    assert False
+else:
+  if os.name == 'nt' or (os.getenv('SYSTEMROOT') is not None and 'windows' in os.getenv('SYSTEMROOT').lower()) or (os.getenv('COMSPEC') is not None and 'windows' in os.getenv('COMSPEC').lower()):
+    WINDOWS = True
+
+  if os.getenv('MSYSTEM'):
+    MSYS = True
+    # Some functions like os.path.normpath() exhibit different behavior between
+    # different versions of Python, so we need to distinguish between the MinGW
+    # and MSYS versions of Python
+    if sysconfig.get_platform() == 'mingw':
+      MINGW = True
+    if os.getenv('MSYSTEM') != 'MSYS' and os.getenv('MSYSTEM') != 'MINGW64':
+      # https://stackoverflow.com/questions/37460073/msys-vs-mingw-internal-environment-variables
+      errlog('Warning: MSYSTEM environment variable is present, and is set to "' + os.getenv('MSYSTEM') + '". This shell has not been tested with emsdk and may not work.')
+
+  if platform.mac_ver()[0] != '':
+    MACOS = True
+
+  if not MACOS and (platform.system() == 'Linux'):
+    LINUX = True
 
 UNIX = (MACOS or LINUX)
 
@@ -111,20 +128,18 @@ if WINDOWS:
 else:
   ENVPATH_SEPARATOR = ':'
 
-ARCH = 'unknown'
 # platform.machine() may return AMD64 on windows, so standardize the case.
-machine = platform.machine().lower()
+machine = os.getenv('EMSDK_ARCH', platform.machine().lower())
 if machine.startswith('x64') or machine.startswith('amd64') or machine.startswith('x86_64'):
   ARCH = 'x86_64'
 elif machine.endswith('86'):
   ARCH = 'x86'
 elif machine.startswith('aarch64') or machine.lower().startswith('arm64'):
   ARCH = 'aarch64'
-elif platform.machine().startswith('arm'):
+elif machine.startswith('arm'):
   ARCH = 'arm'
 else:
-  errlog("Warning: unknown machine architecture " + machine)
-  errlog()
+  exit_with_error('unknown machine architecture: ' + machine)
 
 # Don't saturate all cores to not steal the whole system, but be aggressive.
 CPU_CORES = int(os.environ.get('EMSDK_NUM_CORES', max(multiprocessing.cpu_count() - 1, 1)))
@@ -2131,8 +2146,7 @@ def find_sdk(name):
 
 
 def is_os_64bit():
-  # http://stackoverflow.com/questions/2208828/detect-64bit-os-windows-in-python
-  return platform.machine().endswith('64')
+  return ARCH.endswith('64')
 
 
 def find_latest_version():
@@ -2267,11 +2281,6 @@ def load_file_index_list(filename):
   # Sort versions from oldest to newest (the default sort would be
   # lexicographic, i.e. '1.37.1 < 1.37.10 < 1.37.2')
   return sorted(items, key=version_key)
-
-
-def exit_with_error(msg):
-  errlog('error: %s' % msg)
-  sys.exit(1)
 
 
 # Load the json info for emscripten-releases.
