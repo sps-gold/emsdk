@@ -42,7 +42,7 @@ emsdk_packages_url = 'https://storage.googleapis.com/webassembly/emscripten-rele
 
 emscripten_releases_repo = 'https://chromium.googlesource.com/emscripten-releases'
 
-emscripten_releases_download_url_template = "https://storage.googleapis.com/webassembly/emscripten-releases-builds/%s/%s/wasm-binaries.%s"
+emscripten_releases_download_url_template = "https://storage.googleapis.com/webassembly/emscripten-releases-builds/%s/%s/wasm-binaries%s.%s"
 
 # This was previously `master.zip` but we are transitioning to `main` and
 # `HEAD.zip` works for both cases.  In future we could switch this to
@@ -83,9 +83,9 @@ if 'EMSDK_OS' in os.environ:
   elif EMSDK_OS == 'macos':
     MACOS = True
   else:
-    assert False
+    assert False, 'EMSDK_OS must be one of: windows, linux, macos'
 else:
-  if os.name == 'nt' or (os.getenv('SYSTEMROOT') is not None and 'windows' in os.getenv('SYSTEMROOT').lower()) or (os.getenv('COMSPEC') is not None and 'windows' in os.getenv('COMSPEC').lower()):
+  if os.name == 'nt' or ('windows' in os.getenv('SYSTEMROOT', '').lower()) or ('windows' in os.getenv('COMSPEC', '').lower()):
     WINDOWS = True
 
   if os.getenv('MSYSTEM'):
@@ -142,7 +142,7 @@ else:
   exit_with_error('unknown machine architecture: ' + machine)
 
 # Don't saturate all cores to not steal the whole system, but be aggressive.
-CPU_CORES = int(os.environ.get('EMSDK_NUM_CORES', max(multiprocessing.cpu_count() - 1, 1)))
+CPU_CORES = int(os.getenv('EMSDK_NUM_CORES', max(multiprocessing.cpu_count() - 1, 1)))
 
 CMAKE_BUILD_TYPE_OVERRIDE = None
 
@@ -163,17 +163,6 @@ KEEP_DOWNLOADS = bool(os.getenv('EMSDK_KEEP_DOWNLOADS'))
 
 
 def os_name():
-  if WINDOWS:
-    return 'win'
-  elif LINUX:
-    return 'linux'
-  elif MACOS:
-    return 'macos'
-  else:
-    raise Exception('unknown OS')
-
-
-def os_name_for_emscripten_releases():
   if WINDOWS:
     return 'win'
   elif LINUX:
@@ -256,7 +245,9 @@ def which(program):
 
 def vswhere(version):
   try:
-    program_files = os.environ['ProgramFiles(x86)'] if 'ProgramFiles(x86)' in os.environ else os.environ['ProgramFiles']
+    program_files = os.getenv('ProgramFiles(x86)')
+    if not program_files:
+      program_files = os.environ['ProgramFiles']
     vswhere_path = os.path.join(program_files, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe')
     output = json.loads(subprocess.check_output([vswhere_path, '-latest', '-version', '[%s.0,%s.0)' % (version, version + 1), '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath', '-format', 'json']))
     # Visual Studio 2017 Express is not included in the above search, and it
@@ -291,7 +282,6 @@ if WINDOWS:
   elif '--vs2019' in sys.argv:
     CMAKE_GENERATOR = 'Visual Studio 16'
   else:
-    program_files = os.environ['ProgramFiles(x86)'] if 'ProgramFiles(x86)' in os.environ else os.environ['ProgramFiles']
     vs2019_exists = len(vswhere(16)) > 0
     vs2017_exists = len(vswhere(15)) > 0
     mingw_exists = which('mingw32-make') is not None and which('g++') is not None
@@ -490,54 +480,27 @@ def sdk_path(path):
   return to_unix_path(os.path.join(emsdk_path(), path))
 
 
-# Modifies the given file in-place to contain '\r\n' line endings.
-def file_to_crlf(filename):
-  text = open(filename, 'r').read()
-  text = text.replace('\r\n', '\n').replace('\n', '\r\n')
-  open(filename, 'wb').write(text)
-
-
-# Modifies the given file in-place to contain '\n' line endings.
-def file_to_lf(filename):
-  text = open(filename, 'r').read()
-  text = text.replace('\r\n', '\n')
-  open(filename, 'wb').write(text)
-
-
 # Removes a single file, suppressing exceptions on failure.
 def rmfile(filename):
   debug_print('rmfile(' + filename + ')')
-  try:
+  if os.path.lexists(filename):
     os.remove(filename)
-  except:
-    pass
-
-
-def fix_lineendings(filename):
-  if WINDOWS:
-    file_to_crlf(filename)
-  else:
-    file_to_lf(filename)
 
 
 # http://stackoverflow.com/questions/600268/mkdir-p-functionality-in-python
 def mkdir_p(path):
   debug_print('mkdir_p(' + path + ')')
-  if os.path.exists(path):
-    return
   try:
     os.makedirs(path)
   except OSError as exc:  # Python >2.5
-    if exc.errno == errno.EEXIST and os.path.isdir(path):
-      pass
-    else:
+    if exc.errno != errno.EEXIST or not os.path.isdir(path):
       raise
 
 
-def num_files_in_directory(path):
+def is_nonempty_directory(path):
   if not os.path.isdir(path):
-    return 0
-  return len([name for name in os.listdir(path) if os.path.exists(os.path.join(path, name))])
+    return False
+  return len(os.listdir(path)) != 0
 
 
 def run(cmd, cwd=None, quiet=False):
@@ -566,7 +529,8 @@ def untargz(source_filename, dest_dir):
 def fix_potentially_long_windows_pathname(pathname):
   if not WINDOWS:
     return pathname
-  # Test if emsdk calls fix_potentially_long_windows_pathname() with long relative paths (which is problematic)
+  # Test if emsdk calls fix_potentially_long_windows_pathname() with long
+  # relative paths (which is problematic)
   if not os.path.isabs(pathname) and len(pathname) > 200:
     errlog('Warning: Seeing a relative path "' + pathname + '" which is dangerously long for being referenced as a short Windows path name. Refactor emsdk to be able to handle this!')
   if pathname.startswith('\\\\?\\'):
@@ -1069,16 +1033,16 @@ def cmake_configure(generator, build_root, src_root, build_type, extra_cmake_arg
       generator = []
 
     cmdline = ['cmake'] + generator + ['-DCMAKE_BUILD_TYPE=' + build_type, '-DPYTHON_EXECUTABLE=' + sys.executable]
-    # Target macOS 10.11 at minimum, to support widest range of Mac devices from "Mid 2007" and newer:
-    # https://en.wikipedia.org/wiki/MacBook_Pro#Supported_macOS_releases
-    cmdline += ['-DCMAKE_OSX_DEPLOYMENT_TARGET=10.11']
+    # Target macOS 10.14 at minimum, to support widest range of Mac devices from "Early 2008" and newer:
+    # https://en.wikipedia.org/wiki/MacBook_(2006-2012)#Supported_operating_systems
+    cmdline += ['-DCMAKE_OSX_DEPLOYMENT_TARGET=10.14']
     cmdline += extra_cmake_args + [src_root]
 
     print('Running CMake: ' + str(cmdline))
 
     # Specify the deployment target also as an env. var, since some Xcode versions
     # read this instead of the CMake field.
-    os.environ['MACOSX_DEPLOYMENT_TARGET'] = '10.11'
+    os.environ['MACOSX_DEPLOYMENT_TARGET'] = '10.14'
 
     def quote_parens(x):
       if ' ' in x:
@@ -1189,14 +1153,14 @@ def build_fastcomp(tool):
       targets_to_build += ';'
     targets_to_build += 'JSBackend'
   args += ['-DLLVM_TARGETS_TO_BUILD=' + targets_to_build, '-DLLVM_INCLUDE_EXAMPLES=OFF', '-DCLANG_INCLUDE_EXAMPLES=OFF', '-DLLVM_INCLUDE_TESTS=' + tests_arg, '-DCLANG_INCLUDE_TESTS=' + tests_arg, '-DLLVM_ENABLE_ASSERTIONS=' + ('ON' if enable_assertions else 'OFF')]
-  if os.environ.get('LLVM_CMAKE_ARGS'):
+  if os.getenv('LLVM_CMAKE_ARGS'):
     extra_args = os.environ['LLVM_CMAKE_ARGS'].split(',')
     print('Passing the following extra arguments to LLVM CMake configuration: ' + str(extra_args))
     args += extra_args
 
   # MacOS < 10.13 workaround for LLVM build bug https://github.com/kripken/emscripten/issues/5418:
   # specify HAVE_FUTIMENS=0 in the build if building with target SDK that is older than 10.13.
-  if MACOS and (not os.environ.get('LLVM_CMAKE_ARGS') or 'HAVE_FUTIMENS' not in os.environ.get('LLVM_CMAKE_ARGS')) and xcode_sdk_version() < ['10', '13']:
+  if MACOS and ('HAVE_FUTIMENS' not in os.getenv('LLVM_CMAKE_ARGS', '')) and xcode_sdk_version() < ['10', '13']:
     print('Passing -DHAVE_FUTIMENS=0 to LLVM CMake configure to workaround https://github.com/kripken/emscripten/issues/5418. Please update to macOS 10.13 or newer')
     args += ['-DHAVE_FUTIMENS=0']
 
@@ -1264,7 +1228,7 @@ def build_llvm(tool):
     cmake_generator += ' Win64'
     args += ['-Thost=x64']
 
-  if os.environ.get('LLVM_CMAKE_ARGS'):
+  if os.getenv('LLVM_CMAKE_ARGS'):
     extra_args = os.environ['LLVM_CMAKE_ARGS'].split(',')
     print('Passing the following extra arguments to LLVM CMake configuration: ' + str(extra_args))
     args += extra_args
@@ -1615,7 +1579,7 @@ def load_dot_emscripten():
 
 def generate_dot_emscripten(active_tools):
   cfg = 'import os\n'
-  cfg += "emsdk_path = os.path.dirname(os.environ.get('EM_CONFIG')).replace('\\\\', '/')\n"
+  cfg += "emsdk_path = os.path.dirname(os.getenv('EM_CONFIG')).replace('\\\\', '/')\n"
 
   # Different tools may provide the same activated configs; the latest to be
   # activated is the relevant one.
@@ -1661,7 +1625,7 @@ JS_ENGINES = [NODE_JS]
     print('- This can be done for the current shell by running:')
     print('    source "%s"' % emsdk_env)
     print('- Configure emsdk in your shell startup scripts by running:')
-    shell = os.environ.get('SHELL', '')
+    shell = os.getenv('SHELL', '')
     if 'zsh' in shell:
       print('    echo \'source "%s"\' >> $HOME/.zprofile' % emsdk_env)
     elif 'csh' in shell:
@@ -1671,14 +1635,8 @@ JS_ENGINES = [NODE_JS]
 
 
 def find_msbuild_dir():
-  if 'ProgramFiles' in os.environ and os.environ['ProgramFiles']:
-    program_files = os.environ['ProgramFiles']
-  else:
-    program_files = 'C:/Program Files'
-  if 'ProgramFiles(x86)' in os.environ and os.environ['ProgramFiles(x86)']:
-    program_files_x86 = os.environ['ProgramFiles(x86)']
-  else:
-    program_files_x86 = 'C:/Program Files (x86)'
+  program_files = os.getenv('ProgramFiles', 'C:/Program Files')
+  program_files_x86 = os.getenv('ProgramFiles(x86)', 'C:/Program Files (x86)')
   MSBUILDX86_DIR = os.path.join(program_files_x86, "MSBuild/Microsoft.Cpp/v4.0/Platforms")
   MSBUILD_DIR = os.path.join(program_files, "MSBuild/Microsoft.Cpp/v4.0/Platforms")
   if os.path.exists(MSBUILDX86_DIR):
@@ -1747,9 +1705,6 @@ class Tool(object):
   # Specifies the target path where this tool will be installed to. This could
   # either be a directory or a filename (e.g. in case of node.js)
   def installation_path(self):
-    if WINDOWS and hasattr(self, 'windows_install_path'):
-      pth = self.expand_vars(self.windows_install_path)
-      return sdk_path(pth)
     if hasattr(self, 'install_path'):
       pth = self.expand_vars(self.install_path)
       return sdk_path(pth)
@@ -1808,7 +1763,7 @@ class Tool(object):
     if LINUX and hasattr(self, 'linux_url') and self.compatible_with_this_arch():
       return True
 
-    if WINDOWS and (hasattr(self, 'windows_url') or hasattr(self, 'windows_install_path')) and self.compatible_with_this_arch():
+    if WINDOWS and hasattr(self, 'windows_url') and self.compatible_with_this_arch():
       return True
 
     if UNIX and hasattr(self, 'unix_url'):
@@ -1852,7 +1807,7 @@ class Tool(object):
       # This tool does not contain downloadable elements, so it is installed by default.
       return True
 
-    content_exists = os.path.exists(self.installation_path()) and (os.path.isfile(self.installation_path()) or num_files_in_directory(self.installation_path()) > 0)
+    content_exists = is_nonempty_directory(self.installation_path())
 
     # For e.g. fastcomp clang from git repo, the activated PATH is the
     # directory where the compiler is built to, and installation_path is
@@ -2205,10 +2160,14 @@ def get_emscripten_releases_tot():
   # The recent releases are the latest hashes in the git repo. There
   # may not be a build for the most recent ones yet; find the last
   # that does.
+  arch = ''
+  if ARCH == 'aarch64':
+    arch = '-arm64'
   for release in recent_releases:
     url = emscripten_releases_download_url_template % (
-      os_name_for_emscripten_releases(),
+      os_name(),
       release,
+      arch,
       'tbz2' if not WINDOWS else 'zip'
     )
     try:
