@@ -1968,11 +1968,7 @@ class Tool(object):
     elif url.endswith(ARCHIVE_SUFFIXES):
       success = download_and_unzip(url, self.installation_path(), filename_prefix=getattr(self, 'zipfile_prefix', ''))
     else:
-      dst_file = download_file(urljoin(emsdk_packages_url, self.download_url()), self.installation_path())
-      if dst_file:
-        success = True
-      else:
-        success = False
+      assert False, 'unhandled url type: ' + url
 
     if not success:
       exit_with_error("installation failed!")
@@ -2017,7 +2013,7 @@ class Tool(object):
 
   def cleanup_temp_install_files(self):
     if KEEP_DOWNLOADS:
-        return
+      return
     url = self.download_url()
     if url.endswith(ARCHIVE_SUFFIXES):
       download_target = get_download_target(url, zips_subdir, getattr(self, 'zipfile_prefix', ''))
@@ -2465,7 +2461,7 @@ def process_tool_list(tools_to_activate):
 
 
 def write_set_env_script(env_string):
-  assert(WINDOWS)
+  assert(CMD or POWERSHELL)
   open(EMSDK_SET_ENV, 'w').write(env_string)
 
 
@@ -2482,18 +2478,18 @@ def set_active_tools(tools_to_activate, permanently_activate, system):
 
   generate_dot_emscripten(tools_to_activate)
 
-  # Construct a .bat script that will be invoked to set env. vars and PATH
-  # We only do this on windows since emsdk.bat is able to modify the
-  # calling shell environment.  On other platform `source emsdk_env.sh` is
+  # Construct a .bat or .ps1 script that will be invoked to set env. vars and PATH
+  # We only do this on cmd or powershell since emsdk.bat/ps1 is able to modify the
+  # calling shell environment.  On other shell `source emsdk_env.sh` is
   # required.
-  if WINDOWS:
+  if CMD or POWERSHELL:
     # always set local environment variables since permanently activating will only set the registry settings and
     # will not affect the current session
     env_vars_to_add = get_env_vars_to_add(tools_to_activate, system, user=permanently_activate)
     env_string = construct_env_with_vars(env_vars_to_add)
     write_set_env_script(env_string)
 
-    if permanently_activate:
+    if WINDOWS and permanently_activate:
       win_set_environment_variables(env_vars_to_add, system, user=permanently_activate)
 
   return tools_to_activate
@@ -3105,7 +3101,7 @@ def main(args):
     tools_to_activate = currently_active_tools()
     tools_to_activate = process_tool_list(tools_to_activate)
     env_string = construct_env(tools_to_activate, arg_system, arg_permanent)
-    if WINDOWS and not BASH:
+    if CMD or POWERSHELL:
       write_set_env_script(env_string)
     else:
       sys.stdout.write(env_string)
