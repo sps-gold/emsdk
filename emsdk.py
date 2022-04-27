@@ -735,11 +735,17 @@ def run_get_output(cmd, cwd=None):
   return (process.returncode, stdout, stderr)
 
 
+cached_git_executable = None
+
+
 # must_succeed: If false, the search is performed silently without printing out
 #               errors if not found. Empty string is returned if git is not found.
 #               If true, the search is required to succeed, and the execution
 #               will terminate with sys.exit(1) if not found.
 def GIT(must_succeed=True):
+  global cached_git_executable
+  if cached_git_executable is not None:
+    return cached_git_executable
   # The order in the following is important, and specifies the preferred order
   # of using the git tools.  Primarily use git from emsdk if installed. If not,
   # use system git.
@@ -748,6 +754,7 @@ def GIT(must_succeed=True):
     try:
       ret, stdout, stderr = run_get_output([git, '--version'])
       if ret == 0:
+        cached_git_executable = git
         return git
     except:
       pass
@@ -781,21 +788,21 @@ def git_recent_commits(repo_path, n=20):
     return []
 
 
-def git_clone(url, dstpath):
+def git_clone(url, dstpath, branch):
   debug_print('git_clone(url=' + url + ', dstpath=' + dstpath + ')')
   if os.path.isdir(os.path.join(dstpath, '.git')):
     debug_print("Repository '" + url + "' already cloned to directory '" + dstpath + "', skipping.")
     return True
   mkdir_p(dstpath)
-  git_clone_args = []
+  git_clone_args = ['--recurse-submodules', '--branch', branch]  # Do not check out a branch (installer will issue a checkout command right after)
   if GIT_CLONE_SHALLOW:
     git_clone_args += ['--depth', '1']
   print('Cloning from ' + url + '...')
-  return run([GIT(), 'clone', '--recurse-submodules'] + git_clone_args + [url, dstpath]) == 0
+  return run([GIT(), 'clone'] + git_clone_args + [url, dstpath]) == 0
 
 
-def git_checkout_and_pull(repo_path, branch_or_tag):
-  debug_print('git_checkout_and_pull(repo_path=' + repo_path + ', branch/tag=' + branch_or_tag + ')')
+def git_pull(repo_path, branch_or_tag):
+  debug_print('git_pull(repo_path=' + repo_path + ', branch/tag=' + branch_or_tag + ')')
   ret = run([GIT(), 'fetch', '--quiet', 'origin'], repo_path)
   if ret != 0:
     return False
@@ -828,11 +835,12 @@ def git_checkout_and_pull(repo_path, branch_or_tag):
 
 def git_clone_checkout_and_pull(url, dstpath, branch):
   debug_print('git_clone_checkout_and_pull(url=' + url + ', dstpath=' + dstpath + ', branch=' + branch + ')')
-  success = git_clone(url, dstpath)
-  if not success:
-    return False
-  success = git_checkout_and_pull(dstpath, branch)
-  return success
+
+  # If the repository has already been cloned before, issue a pull operation. Otherwise do a new clone.
+  if os.path.isdir(os.path.join(dstpath, '.git')):
+    return git_pull(dstpath, branch)
+  else:
+    return git_clone(url, dstpath, branch)
 
 
 # Each tool can have its own build type, or it can be overridden on the command
@@ -1036,6 +1044,10 @@ def cmake_configure(generator, build_root, src_root, build_type, extra_cmake_arg
     # Target macOS 10.14 at minimum, to support widest range of Mac devices from "Early 2008" and newer:
     # https://en.wikipedia.org/wiki/MacBook_(2006-2012)#Supported_operating_systems
     cmdline += ['-DCMAKE_OSX_DEPLOYMENT_TARGET=10.14']
+    # To enable widest possible chance of success for building, let the code
+    # compile through with older toolchains that are about to be deprecated by
+    # upstream LLVM.
+    cmdline += ['-DLLVM_TEMPORARILY_ALLOW_OLD_TOOLCHAIN=ON']
     cmdline += extra_cmake_args + [src_root]
 
     print('Running CMake: ' + str(cmdline))
@@ -1395,6 +1407,8 @@ def emscripten_npm_install(tool, directory):
   env = os.environ.copy()
   env["PATH"] = node_path + os.pathsep + env["PATH"]
   print('Running post-install step: npm ci ...')
+  # Do a --no-optional install to avoid bloating disk size:
+  # https://github.com/emscripten-core/emscripten/issues/12406
   try:
     subprocess.check_output(
         [npm, 'ci', '--production', '--no-optional'],
@@ -1403,6 +1417,66 @@ def emscripten_npm_install(tool, directory):
   except subprocess.CalledProcessError as e:
     errlog('Error running %s:\n%s' % (e.cmd, e.output))
     return False
+
+  # Manually install the appropriate native Closure Compiler package
+  # This is currently needed because npm ci would install the packages
+  # for Closure for all platforms, adding 180MB to the download size
+  # There are two problems here:
+  #   1. npm ci does not consider the platform of optional dependencies
+  #      https://github.com/npm/cli/issues/558
+  #   2. A bug with the native compiler has bloated the packages from
+  #      30MB to almost 300MB
+  #      https://github.com/google/closure-compiler-npm/issues/186
+  # If either of these bugs are fixed then we can remove this exception
+  # See also https://github.com/google/closure-compiler/issues/3925
+  closure_compiler_native = ''
+  if LINUX and ARCH in ('x86', 'x86_64'):
+    closure_compiler_native = 'google-closure-compiler-linux'
+  if MACOS and ARCH in ('x86', 'x86_64'):
+    closure_compiler_native = 'google-closure-compiler-osx'
+  if WINDOWS and ARCH == 'x86_64':
+    closure_compiler_native = 'google-closure-compiler-windows'
+
+  if closure_compiler_native:
+    # Check which version of native Closure Compiler we want to install via npm.
+    # (npm install command has this requirement that we must explicitly tell the pinned version)
+    try:
+      closure_version = json.load(open(os.path.join(directory, 'package.json')))['dependencies']['google-closure-compiler']
+    except KeyError as e:
+      # The target version of Emscripten does not (did not) have a package.json that would contain google-closure-compiler. (fastcomp)
+      # Skip manual native google-closure-compiler installation there.
+      print(str(e))
+      print('Emscripten version does not have a npm package.json with google-closure-compiler dependency, skipping native google-closure-compiler install step')
+      return True
+
+    closure_compiler_native += '@' + closure_version
+    print('Running post-install step: npm install', closure_compiler_native)
+    try:
+      subprocess.check_output(
+        [npm, 'install', '--production', '--no-optional', closure_compiler_native],
+        cwd=directory, stderr=subprocess.STDOUT, env=env,
+        universal_newlines=True)
+
+      # Installation of native Closure compiler was successful, so remove import of Java Closure Compiler module to avoid
+      # a Java dependency.
+      compiler_filename = os.path.join(directory, 'node_modules', 'google-closure-compiler', 'lib', 'node', 'closure-compiler.js')
+      if os.path.isfile(compiler_filename):
+        old_js = open(compiler_filename, 'r').read()
+        new_js = old_js.replace("require('google-closure-compiler-java')", "''/*require('google-closure-compiler-java') XXX Removed by Emsdk*/")
+        if old_js == new_js:
+          raise Exception('Failed to patch google-closure-compiler-java dependency away!')
+        open(compiler_filename, 'w').write(new_js)
+
+        # Now that we succeeded to install the native version and patch away the Java dependency, delete the Java version
+        # since that takes up ~12.5MB of installation space that is no longer needed.
+        # This process is currently a little bit hacky, see https://github.com/google/closure-compiler/issues/3926
+        remove_tree(os.path.join(directory, 'node_modules', 'google-closure-compiler-java'))
+        print('Removed google-closure-compiler-java dependency.')
+      else:
+        errlog('Failed to patch away google-closure-compiler Java dependency. ' + compiler_filename + ' does not exist.')
+    except subprocess.CalledProcessError as e:
+      errlog('Error running %s:\n%s' % (e.cmd, e.output))
+      return False
 
   print('Done running: npm ci')
   return True
@@ -1469,7 +1543,7 @@ def build_binaryen_tool(tool):
   build_type = decide_cmake_build_type(tool)
 
   # Configure
-  args = []
+  args = ['-DENABLE_WERROR=0']  # -Werror is not useful for end users
 
   cmake_generator = CMAKE_GENERATOR
   if 'Visual Studio 16' in CMAKE_GENERATOR:  # VS2019
