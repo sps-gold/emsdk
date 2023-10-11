@@ -25,6 +25,11 @@ def _wasm_transition_impl(settings, attr):
     if attr.simd:
         features.append("wasm_simd")
 
+    platform = "@emsdk//:platform_wasm"
+    if attr.standalone:
+        platform = "@emsdk//:platform_wasi"
+        features.append("wasm_standalone")
+
     return {
         "//command_line_option:compiler": "emscripten",
         "//command_line_option:crosstool_top": "@emsdk//emscripten_toolchain:everything",
@@ -32,7 +37,7 @@ def _wasm_transition_impl(settings, attr):
         "//command_line_option:features": features,
         "//command_line_option:dynamic_mode": "off",
         "//command_line_option:linkopt": linkopts,
-        "//command_line_option:platforms": [],
+        "//command_line_option:platforms": [platform],
         "//command_line_option:custom_malloc": "@emsdk//emscripten_toolchain:malloc",
     }
 
@@ -84,6 +89,9 @@ _WASM_BINARY_COMMON_ATTRS = {
         values = ["_default", "emscripten", "off"],
     ),
     "simd": attr.bool(
+        default = False,
+    ),
+    "standalone": attr.bool(
         default = False,
     ),
     "_allowlist_function_transition": attr.label(
@@ -163,7 +171,6 @@ def _wasm_cc_binary_legacy_impl(ctx):
     )
 
 _wasm_cc_binary = rule(
-    name = "wasm_cc_binary",
     implementation = _wasm_cc_binary_impl,
     attrs = dict(
         _WASM_BINARY_COMMON_ATTRS,
@@ -193,7 +200,6 @@ def _wasm_binary_legacy_outputs(name, cc_target):
     return outputs
 
 _wasm_cc_binary_legacy = rule(
-    name = "wasm_cc_binary",
     implementation = _wasm_cc_binary_legacy_impl,
     attrs = _WASM_BINARY_COMMON_ATTRS,
     outputs = _wasm_binary_legacy_outputs,

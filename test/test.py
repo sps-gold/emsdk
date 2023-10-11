@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -9,16 +10,15 @@ import unittest
 
 WINDOWS = sys.platform.startswith('win')
 MACOS = sys.platform == 'darwin'
+MACOS_ARM64 = MACOS and platform.machine() == 'arm64'
 
-assert 'EM_CONFIG' in os.environ, "emsdk should be activated before running this script"
+emconfig = os.path.abspath('.emscripten')
+assert os.path.exists(emconfig)
 
-emconfig = os.environ['EM_CONFIG']
 upstream_emcc = os.path.join('upstream', 'emscripten', 'emcc')
-fastcomp_emcc = os.path.join('fastcomp', 'emscripten', 'emcc')
 emsdk = './emsdk'
 if WINDOWS:
   upstream_emcc += '.bat'
-  fastcomp_emcc += '.bat'
   emsdk = 'emsdk.bat'
 else:
   emsdk = './emsdk'
@@ -164,34 +164,11 @@ int main() {
     print('test .emscripten contents')
     with open(emconfig) as f:
       config = f.read()
-    assert 'fastcomp' not in config
     assert 'upstream' in config
 
   def test_lib_building(self):
     print('building proper system libraries')
     do_lib_building(upstream_emcc)
-
-  def test_fastcomp(self):
-    print('test the last fastcomp release')
-    run_emsdk('install 1.40.1-fastcomp')
-    run_emsdk('activate 1.40.1-fastcomp')
-
-    do_lib_building(fastcomp_emcc)
-    with open(emconfig) as f:
-      config = f.read()
-    assert config.count('LLVM_ROOT') == 1
-    assert 'upstream' not in config
-    assert 'fastcomp' in config
-
-    print('verify latest fastcomp version is fixed at 1.40.1')
-    checked_call_with_output(fastcomp_emcc + ' -v', '1.40.1', stderr=subprocess.STDOUT)
-
-  def test_fastcomp_missing(self):
-    print('verify that attempting to use newer fastcomp gives an error')
-    fastcomp_error = 'the fastcomp backend is not getting new builds or releases. Please use the upstream llvm backend or use an older version than 2.0.0 (such as 1.40.1).'
-    failing_call_with_output(emsdk + ' install latest-fastcomp', fastcomp_error)
-    failing_call_with_output(emsdk + ' install tot-fastcomp', fastcomp_error)
-    failing_call_with_output(emsdk + ' install 2.0.0-fastcomp', fastcomp_error)
 
   def test_redownload(self):
     print('go back to using upstream')
@@ -199,9 +176,9 @@ int main() {
 
     # Test the normal tools like node don't re-download on re-install
     print('another install must re-download')
-    checked_call_with_output(emsdk + ' uninstall node-14.18.2-64bit')
-    checked_call_with_output(emsdk + ' install node-14.18.2-64bit', expected='Downloading:', unexpected='already installed')
-    checked_call_with_output(emsdk + ' install node-14.18.2-64bit', unexpected='Downloading:', expected='already installed')
+    checked_call_with_output(emsdk + ' uninstall node-15.14.0-64bit')
+    checked_call_with_output(emsdk + ' install node-15.14.0-64bit', expected='Downloading:', unexpected='already installed')
+    checked_call_with_output(emsdk + ' install node-15.14.0-64bit', unexpected='Downloading:', expected='already installed')
 
   def test_tot_upstream(self):
     print('test update-tags')
@@ -221,26 +198,21 @@ int main() {
     # Specificlly test with `--closure` so we know that node_modules is working
     check_call(upstream_emcc + ' hello_world.c --closure=1')
 
-  def test_specific_old(self):
-    print('test specific release (old, using sdk-* notation)')
-    run_emsdk('install sdk-fastcomp-1.38.31-64bit')
-    run_emsdk('activate sdk-fastcomp-1.38.31-64bit')
-
   def test_specific_version(self):
+    if MACOS_ARM64:
+      self.skipTest('Old sdk versions do not have ARM64 binaries')
     print('test specific release (new, short name)')
     run_emsdk('install 1.38.33')
     print('another install, but no need for re-download')
     checked_call_with_output(emsdk + ' install 1.38.33', expected='Skipped', unexpected='Downloading:')
     run_emsdk('activate 1.38.33')
-    with open(emconfig) as f:
-      config = f.read()
-    assert 'upstream' not in config
-    assert 'fastcomp' in config
 
   def test_specific_version_full(self):
+    if MACOS_ARM64:
+      self.skipTest('Old sdk versions do not have ARM64 binaries')
     print('test specific release (new, full name)')
-    run_emsdk('install sdk-1.38.33-upstream-64bit')
-    run_emsdk('activate sdk-1.38.33-upstream-64bit')
+    run_emsdk('install sdk-1.38.33-64bit')
+    run_emsdk('activate sdk-1.38.33-64bit')
     print('test specific release (new, tag name)')
     run_emsdk('install sdk-tag-1.38.33-64bit')
     run_emsdk('activate sdk-tag-1.38.33-64bit')
@@ -254,7 +226,8 @@ int main() {
   def test_no_32bit(self):
     print('test 32-bit error')
     emsdk_hacked = hack_emsdk('not is_os_64bit()', 'True')
-    failing_call_with_output('python %s install latest' % emsdk_hacked, 'this tool is only provided for 64-bit OSes')
+    failing_call_with_output('%s %s install latest' % (sys.executable, emsdk_hacked),
+                             'this tool is only provided for 64-bit OSes')
     os.remove(emsdk_hacked)
 
   def test_update_no_git(self):
@@ -277,18 +250,18 @@ int main() {
 
   def test_install_arbitrary(self):
     # Test that its possible to install arbrary emscripten-releases SDKs
-    run_emsdk('install 5c776e6a91c0cb8edafca16a652ee1ee48f4f6d2')
+    run_emsdk('install 1b7f7bc6002a3ca73647f41fc10e1fac7f06f804')
 
     # Check that its not re-downloaded
-    checked_call_with_output(emsdk + ' install 5c776e6a91c0cb8edafca16a652ee1ee48f4f6d2', expected='Skipped', unexpected='Downloading:')
+    checked_call_with_output(emsdk + ' install 1b7f7bc6002a3ca73647f41fc10e1fac7f06f804', expected='Skipped', unexpected='Downloading:')
 
   def test_install_tool(self):
     # Test that its possible to install emscripten as tool instead of SDK
-    checked_call_with_output(emsdk + ' install releases-upstream-77b065ace39e6ab21446e13f92897f956c80476a', unexpected='Installing SDK')
+    checked_call_with_output(emsdk + ' install releases-77b065ace39e6ab21446e13f92897f956c80476a', unexpected='Installing SDK')
 
   def test_activate_missing(self):
     run_emsdk('install latest')
-    failing_call_with_output(emsdk + ' activate 2.0.1', expected="error: tool is not installed and therefore cannot be activated: 'releases-upstream-13e29bd55185e3c12802bc090b4507901856b2ba-64bit'")
+    failing_call_with_output(emsdk + ' activate 2.0.1', expected="error: tool is not installed and therefore cannot be activated: 'releases-13e29bd55185e3c12802bc090b4507901856b2ba-64bit'")
 
   def test_keep_downloads(self):
     env = os.environ.copy()
@@ -296,7 +269,7 @@ int main() {
     # With EMSDK_KEEP_DOWNLOADS the downloading should happen on the first
     # install of 2.0.28, and again when we install 2.0.29, but not on the
     # second install of 2.0.28 because the zip should already be local.
-    shutil.rmtree('zips')
+    shutil.rmtree('downloads')
     checked_call_with_output(emsdk + ' install 2.0.28', expected='Downloading:', env=env)
     checked_call_with_output(emsdk + ' install 2.0.29', expected='Downloading:', env=env)
     checked_call_with_output(emsdk + ' install 2.0.28', expected='already downloaded, skipping', unexpected='Downloading:', env=env)

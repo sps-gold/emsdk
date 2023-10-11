@@ -49,14 +49,20 @@ emscripten_releases_download_url_template = "https://storage.googleapis.com/weba
 # `main.zip` perhaps.
 emsdk_zip_download_url = 'https://github.com/emscripten-core/emsdk/archive/HEAD.zip'
 
-zips_subdir = 'zips/'
+download_dir = 'downloads/'
 
 extra_release_tag = None
 
 # Enable this to do very verbose printing about the different steps that are
 # being run. Useful for debugging.
 VERBOSE = int(os.getenv('EMSDK_VERBOSE', '0'))
+QUIET = int(os.getenv('EMSDK_QUIET', '0'))
 TTY_OUTPUT = not os.getenv('EMSDK_NOTTY', not sys.stdout.isatty())
+
+
+def info(msg):
+  if not QUIET:
+    print(msg, file=sys.stderr)
 
 
 def errlog(msg):
@@ -135,11 +141,16 @@ if machine.startswith('x64') or machine.startswith('amd64') or machine.startswit
 elif machine.endswith('86'):
   ARCH = 'x86'
 elif machine.startswith('aarch64') or machine.lower().startswith('arm64'):
-  ARCH = 'aarch64'
+  if WINDOWS:
+    errlog('No support for Windows on Arm, fallback to x64')
+    ARCH = 'x86_64'
+  else:
+    ARCH = 'arm64'
 elif machine.startswith('arm'):
   ARCH = 'arm'
 else:
   exit_with_error('unknown machine architecture: ' + machine)
+
 
 # Don't saturate all cores to not steal the whole system, but be aggressive.
 CPU_CORES = int(os.getenv('EMSDK_NUM_CORES', max(multiprocessing.cpu_count() - 1, 1)))
@@ -182,15 +193,13 @@ def to_unix_path(p):
   return p.replace('\\', '/')
 
 
-def emsdk_path():
-  return to_unix_path(os.path.dirname(os.path.realpath(__file__)))
-
+EMSDK_PATH = to_unix_path(os.path.dirname(os.path.realpath(__file__)))
 
 EMSDK_SET_ENV = ""
 if POWERSHELL:
-  EMSDK_SET_ENV = os.path.join(emsdk_path(), 'emsdk_set_env.ps1')
+  EMSDK_SET_ENV = os.path.join(EMSDK_PATH, 'emsdk_set_env.ps1')
 else:
-  EMSDK_SET_ENV = os.path.join(emsdk_path(), 'emsdk_set_env.bat')
+  EMSDK_SET_ENV = os.path.join(EMSDK_PATH, 'emsdk_set_env.bat')
 
 
 # Parses https://github.com/emscripten-core/emscripten/tree/d6aced8 to a pair (https://github.com/emscripten-core/emscripten, d6aced8)
@@ -249,14 +258,11 @@ def vswhere(version):
     if not program_files:
       program_files = os.environ['ProgramFiles']
     vswhere_path = os.path.join(program_files, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe')
-    output = json.loads(subprocess.check_output([vswhere_path, '-latest', '-version', '[%s.0,%s.0)' % (version, version + 1), '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath', '-format', 'json']))
-    # Visual Studio 2017 Express is not included in the above search, and it
-    # does not have the VC.Tools.x86.x64 tool, so do a catch-all attempt as a
-    # fallback, to detect Express version.
-    if not output:
-      output = json.loads(subprocess.check_output([vswhere_path, '-latest', '-version', '[%s.0,%s.0)' % (version, version + 1), '-products', '*', '-property', 'installationPath', '-format', 'json']))
-      if not output:
-        return ''
+    # Source: https://learn.microsoft.com/en-us/visualstudio/install/workload-component-id-vs-build-tools?view=vs-2022
+    tools_arch = 'ARM64' if ARCH == 'arm64' else 'x86.x64'
+    # The "-products *" allows detection of Build Tools, the "-prerelease" allows detection of Preview version
+    # of Visual Studio and Build Tools.
+    output = json.loads(subprocess.check_output([vswhere_path, '-latest', '-products', '*', '-prerelease', '-version', '[%s.0,%s.0)' % (version, version + 1), '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.' + tools_arch, '-property', 'installationPath', '-format', 'json']))
     return str(output[0]['installationPath'])
   except Exception:
     return ''
@@ -277,36 +283,30 @@ if WINDOWS:
   # Detect which CMake generator to use when building on Windows
   if '--mingw' in sys.argv:
     CMAKE_GENERATOR = 'MinGW Makefiles'
-  elif '--vs2017' in sys.argv:
-    CMAKE_GENERATOR = 'Visual Studio 15'
+  elif '--vs2022' in sys.argv:
+    CMAKE_GENERATOR = 'Visual Studio 17'
   elif '--vs2019' in sys.argv:
     CMAKE_GENERATOR = 'Visual Studio 16'
+  elif len(vswhere(17)) > 0:
+    CMAKE_GENERATOR = 'Visual Studio 17'
+  elif len(vswhere(16)) > 0:
+    CMAKE_GENERATOR = 'Visual Studio 16'
+  elif which('mingw32-make') is not None and which('g++') is not None:
+    CMAKE_GENERATOR = 'MinGW Makefiles'
   else:
-    vs2019_exists = len(vswhere(16)) > 0
-    vs2017_exists = len(vswhere(15)) > 0
-    mingw_exists = which('mingw32-make') is not None and which('g++') is not None
-    if vs2019_exists:
-      CMAKE_GENERATOR = 'Visual Studio 16'
-    elif vs2017_exists:
-      # VS2017 has an LLVM build issue, see
-      # https://github.com/kripken/emscripten-fastcomp/issues/185
-      CMAKE_GENERATOR = 'Visual Studio 15'
-    elif mingw_exists:
-      CMAKE_GENERATOR = 'MinGW Makefiles'
-    else:
-      # No detected generator
-      CMAKE_GENERATOR = ''
+    # No detected generator
+    CMAKE_GENERATOR = ''
 
 
-sys.argv = [a for a in sys.argv if a not in ('--mingw', '--vs2017', '--vs2019')]
+sys.argv = [a for a in sys.argv if a not in ('--mingw', '--vs2019', '--vs2022')]
 
 
 # Computes a suitable path prefix to use when building with a given generator.
 def cmake_generator_prefix():
+  if CMAKE_GENERATOR == 'Visual Studio 17':
+    return '_vs2022'
   if CMAKE_GENERATOR == 'Visual Studio 16':
     return '_vs2019'
-  if CMAKE_GENERATOR == 'Visual Studio 15':
-    return '_vs2017'
   elif CMAKE_GENERATOR == 'MinGW Makefiles':
     return '_mingw'
   # Unix Makefiles do not specify a path prefix for backwards path compatibility
@@ -477,7 +477,7 @@ def sdk_path(path):
   if os.path.isabs(path):
     return path
 
-  return to_unix_path(os.path.join(emsdk_path(), path))
+  return to_unix_path(os.path.join(EMSDK_PATH, path))
 
 
 # Removes a single file, suppressing exceptions on failure.
@@ -672,7 +672,8 @@ def get_download_target(url, dstpath, filename_prefix=''):
 
 # On success, returns the filename on the disk pointing to the destination file that was produced
 # On failure, returns None.
-def download_file(url, dstpath, download_even_if_exists=False, filename_prefix=''):
+def download_file(url, dstpath, download_even_if_exists=False,
+                  filename_prefix='', silent=False):
   debug_print('download_file(url=' + url + ', dstpath=' + dstpath + ')')
   file_name = get_download_target(url, dstpath, filename_prefix)
 
@@ -717,9 +718,10 @@ def download_file(url, dstpath, download_even_if_exists=False, filename_prefix='
         print(']')
         sys.stdout.flush()
   except Exception as e:
-    errlog("Error: Downloading URL '" + url + "': " + str(e))
-    if "SSL: CERTIFICATE_VERIFY_FAILED" in str(e) or "urlopen error unknown url type: https" in str(e):
-      errlog("Warning: Possibly SSL/TLS issue. Update or install Python SSL root certificates (2048-bit or greater) supplied in Python folder or https://pypi.org/project/certifi/ and try again.")
+    if not silent:
+      errlog("Error: Downloading URL '" + url + "': " + str(e))
+      if "SSL: CERTIFICATE_VERIFY_FAILED" in str(e) or "urlopen error unknown url type: https" in str(e):
+        errlog("Warning: Possibly SSL/TLS issue. Update or install Python SSL root certificates (2048-bit or greater) supplied in Python folder or https://pypi.org/project/certifi/ and try again.")
     rmfile(file_name)
     return None
   except KeyboardInterrupt:
@@ -854,14 +856,7 @@ def decide_cmake_build_type(tool):
 
 # The root directory of the build.
 def llvm_build_dir(tool):
-  generator_suffix = ''
-  if CMAKE_GENERATOR == 'Visual Studio 15':
-    generator_suffix = '_vs2017'
-  elif CMAKE_GENERATOR == 'Visual Studio 16':
-    generator_suffix = '_vs2019'
-  elif CMAKE_GENERATOR == 'MinGW Makefiles':
-    generator_suffix = '_mingw'
-
+  generator_suffix = cmake_generator_prefix()
   bitness_suffix = '_32' if tool.bitness == 32 else '_64'
 
   if hasattr(tool, 'git_branch'):
@@ -879,7 +874,7 @@ def exe_suffix(filename):
 
 # The directory where the binaries are produced. (relative to the installation
 # root directory of the tool)
-def fastcomp_build_bin_dir(tool):
+def llvm_build_bin_dir(tool):
   build_dir = llvm_build_dir(tool)
   if WINDOWS and 'Visual Studio' in CMAKE_GENERATOR:
     old_llvm_bin_dir = os.path.join(build_dir, 'bin', decide_cmake_build_type(tool))
@@ -909,112 +904,38 @@ def build_env(generator):
   # See https://groups.google.com/forum/#!topic/emscripten-discuss/5Or6QIzkqf0
   if MACOS:
     build_env['CXXFLAGS'] = ((build_env['CXXFLAGS'] + ' ') if hasattr(build_env, 'CXXFLAGS') else '') + '-stdlib=libc++'
-  elif 'Visual Studio 15' in generator or 'Visual Studio 16' in generator:
-    if 'Visual Studio 16' in generator:
-      path = vswhere(16)
-    else:
-      path = vswhere(15)
-
-    # Configuring CMake for Visual Studio needs and env. var VCTargetsPath to be present.
-    # How this is supposed to work is unfortunately very undocumented. See
-    # https://discourse.cmake.org/t/cmake-failed-to-get-the-value-of-vctargetspath-with-vs2019-16-7/1839/16
-    # for some conversation. Try a couple of common paths if one of them would work.
-    # In the future as new versions of VS come out, we likely need to add new paths into this list.
-    if 'VCTargetsPath' not in build_env:
-      vctargets_paths = [
-        os.path.join(path, 'MSBuild\\Microsoft\\VC\\v160\\'),
-        os.path.join(path, 'Common7\\IDE\\VC\\VCTargets')
-      ]
-      for p in vctargets_paths:
-        if os.path.isfile(os.path.join(p, 'Microsoft.Cpp.Default.props')):
-          debug_print('Set env. var VCTargetsPath=' + p + ' for CMake.')
-          build_env['VCTargetsPath'] = p
-          break
-        else:
-          debug_print('Searched path ' + p + ' as candidate for VCTargetsPath, not working.')
-
-      if 'VCTargetsPath' not in build_env:
-        errlog('Unable to locate Visual Studio compiler installation for generator "' + generator + '"!')
-        errlog('Either rerun installation in Visual Studio Command Prompt, or locate directory to Microsoft.Cpp.Default.props manually')
-        sys.exit(1)
-
-    # CMake and VS2017 cl.exe needs to have mspdb140.dll et al. in its PATH.
-    vc_bin_paths = [vs_filewhere(path, 'amd64', 'cl.exe'),
-                    vs_filewhere(path, 'x86', 'cl.exe')]
-    for path in vc_bin_paths:
-      if os.path.isdir(path):
-          build_env['PATH'] = build_env['PATH'] + ';' + path
-
+  if WINDOWS:
+    # MSBuild.exe has an internal mechanism to avoid N^2 oversubscription of threads in its two-tier build model, see
+    # https://devblogs.microsoft.com/cppblog/improved-parallelism-in-msbuild/
+    build_env['UseMultiToolTask'] = 'true'
+    build_env['EnforceProcessCountAcrossBuilds'] = 'true'
   return build_env
 
 
-def get_generator_for_sln_file(sln_file):
-  contents = open(sln_file, 'r').read()
-  if '# Visual Studio 16' in contents or '# Visual Studio Version 16' in contents:  # VS2019
-    return 'Visual Studio 16'
-  if '# Visual Studio 15' in contents:  # VS2017
-    return 'Visual Studio 15'
-  raise Exception('Unknown generator used to build solution file ' + sln_file)
-
-
-def find_msbuild(sln_file):
-  # The following logic attempts to find a Visual Studio version specific
-  # MSBuild.exe from a list of known locations.
-  generator = get_generator_for_sln_file(sln_file)
-  debug_print('find_msbuild looking for generator ' + str(generator))
-  if generator == 'Visual Studio 16':  # VS2019
-    path = vswhere(16)
-    search_paths = [os.path.join(path, 'MSBuild/Current/Bin'),
-                    os.path.join(path, 'MSBuild/15.0/Bin/amd64'),
-                    os.path.join(path, 'MSBuild/15.0/Bin')]
-  elif generator == 'Visual Studio 15':  # VS2017
-    path = vswhere(15)
-    search_paths = [os.path.join(path, 'MSBuild/15.0/Bin/amd64'),
-                    os.path.join(path, 'MSBuild/15.0/Bin')]
-  else:
-    raise Exception('Unknown generator!')
-
-  for path in search_paths:
-    p = os.path.join(path, 'MSBuild.exe')
-    debug_print('Searching for MSBuild.exe: ' + p)
-    if os.path.isfile(p):
-      return p
-  debug_print('MSBuild.exe in PATH? ' + str(which('MSBuild.exe')))
-  # Last fallback, try any MSBuild from PATH (might not be compatible, but best effort)
-  return which('MSBuild.exe')
-
-
-def make_build(build_root, build_type, build_target_platform='x64'):
-  debug_print('make_build(build_root=' + build_root + ', build_type=' + build_type + ', build_target_platform=' + build_target_platform + ')')
+def make_build(build_root, build_type):
+  debug_print('make_build(build_root=' + build_root + ', build_type=' + build_type + ')')
   if CPU_CORES > 1:
     print('Performing a parallel build with ' + str(CPU_CORES) + ' cores.')
   else:
     print('Performing a singlethreaded build.')
 
-  generator_to_use = CMAKE_GENERATOR
-
-  if WINDOWS:
-    if 'Visual Studio' in CMAKE_GENERATOR:
-      solution_name = str(subprocess.check_output(['dir', '/b', '*.sln'], shell=True, cwd=build_root).decode('utf-8').strip())
-      generator_to_use = get_generator_for_sln_file(os.path.join(build_root, solution_name))
-      # Disabled for now: Don't pass /maxcpucount argument to msbuild, since it
-      # looks like when building, msbuild already automatically spawns the full
-      # amount of logical cores the system has, and passing the number of
-      # logical cores here has been observed to give a quadratic N*N explosion
-      # on the number of spawned processes (e.g. on a Core i7 5960X with 16
-      # logical cores, it would spawn 16*16=256 cl.exe processes, which would
-      # start crashing when running out of system memory)
-      #      make = [find_msbuild(os.path.join(build_root, solution_name)), '/maxcpucount:' + str(CPU_CORES), '/t:Build', '/p:Configuration=' + build_type, '/nologo', '/verbosity:minimal', solution_name]
-      make = [find_msbuild(os.path.join(build_root, solution_name)), '/t:Build', '/p:Configuration=' + build_type, '/p:Platform=' + build_target_platform, '/nologo', '/verbosity:minimal', solution_name]
-    else:
-      make = ['mingw32-make', '-j' + str(CPU_CORES)]
+  make = ['cmake', '--build', '.', '--config', build_type]
+  if 'Visual Studio' in CMAKE_GENERATOR:
+    # Visual Studio historically has had a two-tier problem in its build system design. A single MSBuild.exe instance only governs
+    # the build of a single project (.exe/.lib/.dll) in a solution. Passing the -j parameter above will only enable multiple MSBuild.exe
+    # instances to be spawned to build multiple projects in parallel, but each MSBuild.exe is still singlethreaded.
+    # To enable each MSBuild.exe instance to also compile several .cpp files in parallel inside a single project, pass the extra
+    # MSBuild.exe specific "Multi-ToolTask" (MTT) setting /p:CL_MPCount. This enables each MSBuild.exe to parallelize builds wide.
+    # This requires CMake 3.12 or newer.
+    make += ['-j', str(CPU_CORES), '--', '/p:CL_MPCount=' + str(CPU_CORES)]
   else:
-    make = ['cmake', '--build', '.', '--', '-j' + str(CPU_CORES)]
+    # Pass -j to native make, CMake might not support -j option.
+    make += ['--', '-j', str(CPU_CORES)]
 
   # Build
   try:
     print('Running build: ' + str(make))
-    ret = subprocess.check_call(make, cwd=build_root, env=build_env(generator_to_use))
+    ret = subprocess.check_call(make, cwd=build_root, env=build_env(CMAKE_GENERATOR))
     if ret != 0:
       errlog('Build failed with exit code ' + ret + '!')
       errlog('Working directory: ' + build_root)
@@ -1101,92 +1022,47 @@ def xcode_sdk_version():
     return subprocess.checkplatform.mac_ver()[0].split('.')
 
 
-def build_fastcomp(tool):
-  debug_print('build_fastcomp(' + str(tool) + ')')
-  fastcomp_root = tool.installation_path()
-  fastcomp_src_root = os.path.join(fastcomp_root, 'src')
-  # Does this tool want to be git cloned from github?
-  if hasattr(tool, 'git_branch'):
-    success = git_clone_checkout_and_pull(tool.download_url(), fastcomp_src_root, tool.git_branch)
-    if not success:
-      return False
-    if hasattr(tool, 'clang_url'):
-      clang_root = os.path.join(fastcomp_src_root, 'tools/clang')
-      success = git_clone_checkout_and_pull(tool.clang_url, clang_root, tool.git_branch)
-      if not success:
-        return False
-    if hasattr(tool, 'lld_url'):
-      lld_root = os.path.join(fastcomp_src_root, 'tools/lld')
-      success = git_clone_checkout_and_pull(tool.lld_url, lld_root, tool.git_branch)
-      if not success:
-        return False
+def cmake_target_platform(tool):
+  # Source: https://cmake.org/cmake/help/latest/generator/Visual%20Studio%2017%202022.html#platform-selection
+  if hasattr(tool, 'arch'):
+    if tool.arch == 'arm64':
+      return 'ARM64'
+    elif tool.arch == 'x86_64':
+      return 'x64'
+    elif tool.arch == 'x86':
+      return 'Win32'
+  if ARCH == 'arm64':
+    return 'ARM64'
   else:
-    # Not a git cloned tool, so instead download from git tagged releases
-    success = download_and_unzip(tool.download_url(), fastcomp_src_root, filename_prefix='llvm-e')
-    if not success:
-      return False
-    success = download_and_unzip(tool.windows_clang_url if WINDOWS else tool.unix_clang_url, os.path.join(fastcomp_src_root, 'tools/clang'), filename_prefix='clang-e')
-    if not success:
-      return False
+    return 'x64' if tool.bitness == 64 else 'Win32'
 
+
+def cmake_host_platform():
+  # Source: https://cmake.org/cmake/help/latest/generator/Visual%20Studio%2017%202022.html#toolset-selection
+  arch_to_cmake_host_platform = {
+    'arm64': 'ARM64',
+    'arm': 'ARM',
+    'x86_64': 'x64',
+    'x86': 'x86'
+  }
+  return arch_to_cmake_host_platform[ARCH]
+
+
+def get_generator_and_config_args(tool):
   args = []
-
   cmake_generator = CMAKE_GENERATOR
-  if 'Visual Studio 16' in CMAKE_GENERATOR:  # VS2019
+  if 'Visual Studio 16' in CMAKE_GENERATOR or 'Visual Studio 17' in CMAKE_GENERATOR:  # VS2019 or VS2022
     # With Visual Studio 16 2019, CMake changed the way they specify target arch.
     # Instead of appending it into the CMake generator line, it is specified
     # with a -A arch parameter.
-    args += ['-A', 'x64' if tool.bitness == 64 else 'x86']
+    args += ['-A', cmake_target_platform(tool)]
+    args += ['-Thost=' + cmake_host_platform()]
   elif 'Visual Studio' in CMAKE_GENERATOR and tool.bitness == 64:
     cmake_generator += ' Win64'
-
-  build_dir = llvm_build_dir(tool)
-  build_root = os.path.join(fastcomp_root, build_dir)
-
-  build_type = decide_cmake_build_type(tool)
-
-  # Configure
-  tests_arg = 'ON' if BUILD_FOR_TESTING else 'OFF'
-
-  enable_assertions = ENABLE_LLVM_ASSERTIONS.lower() == 'on' or (ENABLE_LLVM_ASSERTIONS == 'auto' and build_type.lower() != 'release' and build_type.lower() != 'minsizerel')
-
-  only_supports_wasm = hasattr(tool, 'only_supports_wasm')
-  if ARCH == 'x86' or ARCH == 'x86_64':
-    targets_to_build = 'X86'
-  elif ARCH == 'arm':
-    targets_to_build = 'ARM'
-  elif ARCH == 'aarch64':
-    targets_to_build = 'AArch64'
-  else:
-    # May have problems with emconfigure
-    targets_to_build = ''
-  if not only_supports_wasm:
-    if targets_to_build != '':
-      targets_to_build += ';'
-    targets_to_build += 'JSBackend'
-  args += ['-DLLVM_TARGETS_TO_BUILD=' + targets_to_build, '-DLLVM_INCLUDE_EXAMPLES=OFF', '-DCLANG_INCLUDE_EXAMPLES=OFF', '-DLLVM_INCLUDE_TESTS=' + tests_arg, '-DCLANG_INCLUDE_TESTS=' + tests_arg, '-DLLVM_ENABLE_ASSERTIONS=' + ('ON' if enable_assertions else 'OFF')]
-  if os.getenv('LLVM_CMAKE_ARGS'):
-    extra_args = os.environ['LLVM_CMAKE_ARGS'].split(',')
-    print('Passing the following extra arguments to LLVM CMake configuration: ' + str(extra_args))
-    args += extra_args
-
-  # MacOS < 10.13 workaround for LLVM build bug https://github.com/kripken/emscripten/issues/5418:
-  # specify HAVE_FUTIMENS=0 in the build if building with target SDK that is older than 10.13.
-  if MACOS and ('HAVE_FUTIMENS' not in os.getenv('LLVM_CMAKE_ARGS', '')) and xcode_sdk_version() < ['10', '13']:
-    print('Passing -DHAVE_FUTIMENS=0 to LLVM CMake configure to workaround https://github.com/kripken/emscripten/issues/5418. Please update to macOS 10.13 or newer')
-    args += ['-DHAVE_FUTIMENS=0']
-
-  success = cmake_configure(cmake_generator, build_root, fastcomp_src_root, build_type, args)
-  if not success:
-    return False
-
-  # Make
-  success = make_build(build_root, build_type, 'x64' if tool.bitness == 64 else 'Win32')
-  return success
+    args += ['-Thost=x64']
+  return (cmake_generator, args)
 
 
-# LLVM git source tree migrated to a single repository instead of multiple
-# ones, build_llvm() builds via that repository structure
 def build_llvm(tool):
   debug_print('build_llvm(' + str(tool) + ')')
   llvm_root = tool.installation_path()
@@ -1209,19 +1085,20 @@ def build_llvm(tool):
     targets_to_build = 'WebAssembly;X86'
   elif ARCH == 'arm':
     targets_to_build = 'WebAssembly;ARM'
-  elif ARCH == 'aarch64':
+  elif ARCH == 'arm64':
     targets_to_build = 'WebAssembly;AArch64'
   else:
     targets_to_build = 'WebAssembly'
-  args = ['-DLLVM_TARGETS_TO_BUILD=' + targets_to_build,
-          '-DLLVM_INCLUDE_EXAMPLES=OFF',
-          '-DLLVM_INCLUDE_TESTS=' + tests_arg,
-          '-DCLANG_INCLUDE_TESTS=' + tests_arg,
-          '-DLLVM_ENABLE_ASSERTIONS=' + ('ON' if enable_assertions else 'OFF'),
-          # Disable optional LLVM dependencies, these can cause unwanted .so dependencies
-          # that prevent distributing the generated compiler for end users.
-          '-DLLVM_ENABLE_LIBXML2=OFF', '-DLLVM_ENABLE_TERMINFO=OFF', '-DLLDB_ENABLE_LIBEDIT=OFF',
-          '-DLLVM_ENABLE_LIBEDIT=OFF', '-DLLVM_ENABLE_LIBPFM=OFF']
+  cmake_generator, args = get_generator_and_config_args(tool)
+  args += ['-DLLVM_TARGETS_TO_BUILD=' + targets_to_build,
+           '-DLLVM_INCLUDE_EXAMPLES=OFF',
+           '-DLLVM_INCLUDE_TESTS=' + tests_arg,
+           '-DCLANG_INCLUDE_TESTS=' + tests_arg,
+           '-DLLVM_ENABLE_ASSERTIONS=' + ('ON' if enable_assertions else 'OFF'),
+           # Disable optional LLVM dependencies, these can cause unwanted .so dependencies
+           # that prevent distributing the generated compiler for end users.
+           '-DLLVM_ENABLE_LIBXML2=OFF', '-DLLVM_ENABLE_TERMINFO=OFF', '-DLLDB_ENABLE_LIBEDIT=OFF',
+           '-DLLVM_ENABLE_LIBEDIT=OFF', '-DLLVM_ENABLE_LIBPFM=OFF']
   # LLVM build system bug: compiler-rt does not build on Windows. It insists on performing a CMake install step that writes to C:\Program Files. Attempting
   # to reroute that to build_root directory then fails on an error
   #  file INSTALL cannot find
@@ -1229,16 +1106,6 @@ def build_llvm(tool):
   # (there instead of $(Configuration), one would need ${CMAKE_BUILD_TYPE} ?)
   # It looks like compiler-rt is not compatible to build on Windows?
   args += ['-DLLVM_ENABLE_PROJECTS=clang;lld']
-  cmake_generator = CMAKE_GENERATOR
-  if 'Visual Studio 16' in CMAKE_GENERATOR:  # VS2019
-    # With Visual Studio 16 2019, CMake changed the way they specify target arch.
-    # Instead of appending it into the CMake generator line, it is specified
-    # with a -A arch parameter.
-    args += ['-A', 'x64' if tool.bitness == 64 else 'x86']
-    args += ['-Thost=x64']
-  elif 'Visual Studio' in CMAKE_GENERATOR and tool.bitness == 64:
-    cmake_generator += ' Win64'
-    args += ['-Thost=x64']
 
   if os.getenv('LLVM_CMAKE_ARGS'):
     extra_args = os.environ['LLVM_CMAKE_ARGS'].split(',')
@@ -1251,7 +1118,7 @@ def build_llvm(tool):
     return False
 
   # Make
-  success = make_build(build_root, build_type, 'x64' if tool.bitness == 64 else 'Win32')
+  success = make_build(build_root, build_type)
   return success
 
 
@@ -1269,17 +1136,7 @@ def build_ninja(tool):
   build_type = decide_cmake_build_type(tool)
 
   # Configure
-  cmake_generator = CMAKE_GENERATOR
-  args = []
-  if 'Visual Studio 16' in CMAKE_GENERATOR:  # VS2019
-    # With Visual Studio 16 2019, CMake changed the way they specify target arch.
-    # Instead of appending it into the CMake generator line, it is specified
-    # with a -A arch parameter.
-    args += ['-A', 'x64' if tool.bitness == 64 else 'x86']
-    args += ['-Thost=x64']
-  elif 'Visual Studio' in CMAKE_GENERATOR and tool.bitness == 64:
-    cmake_generator += ' Win64'
-    args += ['-Thost=x64']
+  cmake_generator, args = get_generator_and_config_args(tool)
 
   cmakelists_dir = os.path.join(src_root)
   success = cmake_configure(cmake_generator, build_root, cmakelists_dir, build_type, args)
@@ -1287,7 +1144,7 @@ def build_ninja(tool):
     return False
 
   # Make
-  success = make_build(build_root, build_type, 'x64' if tool.bitness == 64 else 'Win32')
+  success = make_build(build_root, build_type)
 
   if success:
     bin_dir = os.path.join(root, 'bin')
@@ -1318,17 +1175,8 @@ def build_ccache(tool):
   build_type = decide_cmake_build_type(tool)
 
   # Configure
-  cmake_generator = CMAKE_GENERATOR
-  args = ['-DZSTD_FROM_INTERNET=ON']
-  if 'Visual Studio 16' in CMAKE_GENERATOR:  # VS2019
-    # With Visual Studio 16 2019, CMake changed the way they specify target arch.
-    # Instead of appending it into the CMake generator line, it is specified
-    # with a -A arch parameter.
-    args += ['-A', 'x64' if tool.bitness == 64 else 'x86']
-    args += ['-Thost=x64']
-  elif 'Visual Studio' in CMAKE_GENERATOR and tool.bitness == 64:
-    cmake_generator += ' Win64'
-    args += ['-Thost=x64']
+  cmake_generator, args = get_generator_and_config_args(tool)
+  args += ['-DZSTD_FROM_INTERNET=ON']
 
   cmakelists_dir = os.path.join(src_root)
   success = cmake_configure(cmake_generator, build_root, cmakelists_dir, build_type, args)
@@ -1336,7 +1184,7 @@ def build_ccache(tool):
     return False
 
   # Make
-  success = make_build(build_root, build_type, 'x64' if tool.bitness == 64 else 'Win32')
+  success = make_build(build_root, build_type)
 
   if success:
     bin_dir = os.path.join(root, 'bin')
@@ -1488,24 +1336,15 @@ def emscripten_post_install(tool):
   build_root = optimizer_build_root(tool)
   build_type = decide_cmake_build_type(tool)
 
-  args = []
-
   # Configure
-  cmake_generator = CMAKE_GENERATOR
-  if 'Visual Studio 16' in CMAKE_GENERATOR:  # VS2019
-    # With Visual Studio 16 2019, CMake changed the way they specify target arch.
-    # Instead of appending it into the CMake generator line, it is specified
-    # with a -A arch parameter.
-    args += ['-A', 'x64' if tool.bitness == 64 else 'x86']
-  elif 'Visual Studio' in CMAKE_GENERATOR and tool.bitness == 64:
-    cmake_generator += ' Win64'
+  cmake_generator, args = get_generator_and_config_args(tool)
 
   success = cmake_configure(cmake_generator, build_root, src_root, build_type, args)
   if not success:
     return False
 
   # Make
-  success = make_build(build_root, build_type, 'x64' if tool.bitness == 64 else 'Win32')
+  success = make_build(build_root, build_type)
   if not success:
     return False
 
@@ -1543,16 +1382,8 @@ def build_binaryen_tool(tool):
   build_type = decide_cmake_build_type(tool)
 
   # Configure
-  args = ['-DENABLE_WERROR=0']  # -Werror is not useful for end users
-
-  cmake_generator = CMAKE_GENERATOR
-  if 'Visual Studio 16' in CMAKE_GENERATOR:  # VS2019
-    # With Visual Studio 16 2019, CMake changed the way they specify target arch.
-    # Instead of appending it into the CMake generator line, it is specified
-    # with a -A arch parameter.
-    args += ['-A', 'x64' if tool.bitness == 64 else 'x86']
-  elif 'Visual Studio' in CMAKE_GENERATOR and tool.bitness == 64:
-    cmake_generator += ' Win64'
+  cmake_generator, args = get_generator_and_config_args(tool)
+  args += ['-DENABLE_WERROR=0']  # -Werror is not useful for end users
 
   if 'Visual Studio' in CMAKE_GENERATOR:
     if BUILD_FOR_TESTING:
@@ -1563,7 +1394,7 @@ def build_binaryen_tool(tool):
     return False
 
   # Make
-  success = make_build(build_root, build_type, 'x64' if tool.bitness == 64 else 'Win32')
+  success = make_build(build_root, build_type)
 
   # Deploy scripts needed from source repository to build directory
   remove_tree(os.path.join(build_root, 'scripts'))
@@ -1574,23 +1405,41 @@ def build_binaryen_tool(tool):
   return success
 
 
-def download_and_unzip(zipfile, dest_dir, filename_prefix='', clobber=True):
-  debug_print('download_and_unzip(zipfile=' + zipfile + ', dest_dir=' + dest_dir + ')')
+def download_and_extract(archive, dest_dir, filename_prefix='', clobber=True):
+  debug_print('download_and_extract(archive=' + archive + ', dest_dir=' + dest_dir + ')')
 
-  url = urljoin(emsdk_packages_url, zipfile)
-  download_target = get_download_target(url, zips_subdir, filename_prefix)
+  url = urljoin(emsdk_packages_url, archive)
 
-  received_download_target = download_file(url, zips_subdir, not KEEP_DOWNLOADS, filename_prefix)
-  if not received_download_target:
+  def try_download(url, silent=False):
+    return download_file(url, download_dir, not KEEP_DOWNLOADS,
+                         filename_prefix, silent=silent)
+
+  # Special hack for the wasm-binaries we transitioned from `.bzip2` to
+  # `.xz`, but we can't tell from the version/url which one to use, so
+  # try one and then fall back to the other.
+  success = False
+  if 'wasm-binaries' in archive and os.path.splitext(archive)[1] == '.xz':
+    success = try_download(url, silent=True)
+    if not success:
+      alt_url = url.replace('.tar.xz', '.tbz2')
+      success = try_download(alt_url, silent=True)
+      if success:
+        url = alt_url
+
+  if not success:
+    success = try_download(url)
+
+  if not success:
     return False
-  assert received_download_target == download_target
 
   # Remove the old directory, since we have some SDKs that install into the
   # same directory.  If we didn't do this contents of the previous install
   # could remain.
   if clobber:
     remove_tree(dest_dir)
-  if zipfile.endswith('.zip'):
+
+  download_target = get_download_target(url, download_dir, filename_prefix)
+  if archive.endswith('.zip'):
     return unzip(download_target, dest_dir)
   else:
     return untargz(download_target, dest_dir)
@@ -1606,21 +1455,29 @@ def to_native_path(p):
 # Finds and returns a list of the directories that need to be added to PATH for
 # the given set of tools.
 def get_required_path(active_tools):
-  path_add = [to_native_path(emsdk_path())]
+  path_add = [to_native_path(EMSDK_PATH)]
   for tool in active_tools:
     if hasattr(tool, 'activated_path'):
       path = to_native_path(tool.expand_vars(tool.activated_path))
+      # If the tool has an activated_path_skip attribute then we don't add
+      # the tools path to the users path if a program by that name is found
+      # in the existing PATH.  This allows us to, for example, add our version
+      # node to the users PATH if, and only if, they don't already have a
+      # another version of node in thier PATH.
+      if hasattr(tool, 'activated_path_skip'):
+        current_path = which(tool.activated_path_skip)
+        # We found an executable by this name in the current PATH, but we
+        # ignore our own version for this purpose.
+        if current_path and os.path.dirname(current_path) != path:
+          continue
       path_add.append(path)
   return path_add
 
 
 # Returns the absolute path to the file '.emscripten' for the current user on
 # this system.
-def dot_emscripten_path():
-  return os.path.join(emsdk_path(), ".emscripten")
-
-
-dot_emscripten = {}
+EM_CONFIG_PATH = os.path.join(EMSDK_PATH, ".emscripten")
+EM_CONFIG_DICT = {}
 
 
 def parse_key_value(line):
@@ -1635,23 +1492,23 @@ def parse_key_value(line):
     return (key, '')
 
 
-def load_dot_emscripten():
-  dot_emscripten.clear()
+def load_em_config():
+  EM_CONFIG_DICT.clear()
   lines = []
   try:
-    lines = open(dot_emscripten_path(), "r").read().split('\n')
+    lines = open(EM_CONFIG_PATH, "r").read().split('\n')
   except:
     pass
   for line in lines:
     try:
       key, value = parse_key_value(line)
       if value != '':
-        dot_emscripten[key] = value
+        EM_CONFIG_DICT[key] = value
     except:
       pass
 
 
-def generate_dot_emscripten(active_tools):
+def generate_em_config(active_tools):
   cfg = 'import os\n'
   cfg += "emsdk_path = os.path.dirname(os.getenv('EM_CONFIG')).replace('\\\\', '/')\n"
 
@@ -1676,17 +1533,17 @@ COMPILER_ENGINE = NODE_JS
 JS_ENGINES = [NODE_JS]
 '''
 
-  cfg = cfg.replace("'" + emsdk_path(), "emsdk_path + '")
+  cfg = cfg.replace("'" + EMSDK_PATH, "emsdk_path + '")
 
-  if os.path.exists(dot_emscripten_path()):
-    backup_path = dot_emscripten_path() + ".old"
-    move_with_overwrite(dot_emscripten_path(), backup_path)
+  if os.path.exists(EM_CONFIG_PATH):
+    backup_path = EM_CONFIG_PATH + ".old"
+    move_with_overwrite(EM_CONFIG_PATH, backup_path)
 
-  with open(dot_emscripten_path(), "w") as text_file:
+  with open(EM_CONFIG_PATH, "w") as text_file:
     text_file.write(cfg)
 
   # Clear old emscripten content.
-  rmfile(os.path.join(emsdk_path(), ".emscripten_sanity"))
+  rmfile(os.path.join(EMSDK_PATH, ".emscripten_sanity"))
 
   path_add = get_required_path(active_tools)
   if not WINDOWS:
@@ -1754,10 +1611,9 @@ class Tool(object):
     if '%generator_prefix%' in str:
       str = str.replace('%generator_prefix%', cmake_generator_prefix())
     str = str.replace('%.exe%', '.exe' if WINDOWS else '')
-    if '%fastcomp_build_dir%' in str:
-      str = str.replace('%fastcomp_build_dir%', llvm_build_dir(self))
-    if '%fastcomp_build_bin_dir%' in str:
-      str = str.replace('%fastcomp_build_bin_dir%', fastcomp_build_bin_dir(self))
+    if '%llvm_build_bin_dir%' in str:
+      str = str.replace('%llvm_build_bin_dir%', llvm_build_bin_dir(self))
+
     return str
 
   # Return true if this tool requires building from source, and false if this is a precompiled tool.
@@ -1918,16 +1774,16 @@ class Tool(object):
       return len(deps) > 0
 
     for key, value in activated_cfg.items():
-      if key not in dot_emscripten:
+      if key not in EM_CONFIG_DICT:
         debug_print(str(self) + ' is not active, because key="' + key + '" does not exist in .emscripten')
         return False
 
       # all paths are stored dynamically relative to the emsdk root, so
       # normalize those first.
-      dot_emscripten_key = dot_emscripten[key].replace("emsdk_path + '", "'" + emsdk_path())
-      dot_emscripten_key = dot_emscripten_key.strip("'")
-      if dot_emscripten_key != value:
-        debug_print(str(self) + ' is not active, because key="' + key + '" has value "' + dot_emscripten_key + '" but should have value "' + value + '"')
+      config_value = EM_CONFIG_DICT[key].replace("emsdk_path + '", "'" + EMSDK_PATH)
+      config_value = config_value.strip("'")
+      if config_value != value:
+        debug_print(str(self) + ' is not active, because key="' + key + '" has value "' + config_value + '" but should have value "' + value + '"')
         return False
     return True
 
@@ -2003,8 +1859,8 @@ class Tool(object):
 
     if getattr(self, 'custom_install_script', None) == 'emscripten_npm_install':
       # upstream tools have hardcoded paths that are not stored in emsdk_manifest.json registry
-      install_path = 'upstream' if 'releases-upstream' in self.version else 'fastcomp'
-      emscripten_dir = os.path.join(emsdk_path(), install_path, 'emscripten')
+      install_path = 'upstream'
+      emscripten_dir = os.path.join(EMSDK_PATH, install_path, 'emscripten')
       # Older versions of the sdk did not include the node_modules directory
       # and require `npm ci` to be run post-install
       if not os.path.exists(os.path.join(emscripten_dir, 'node_modules')):
@@ -2029,9 +1885,7 @@ class Tool(object):
     print("Installing tool '" + str(self) + "'..")
     url = self.download_url()
 
-    if hasattr(self, 'custom_install_script') and self.custom_install_script == 'build_fastcomp':
-      success = build_fastcomp(self)
-    elif hasattr(self, 'custom_install_script') and self.custom_install_script == 'build_llvm':
+    if hasattr(self, 'custom_install_script') and self.custom_install_script == 'build_llvm':
       success = build_llvm(self)
     elif hasattr(self, 'custom_install_script') and self.custom_install_script == 'build_ninja':
       success = build_ninja(self)
@@ -2040,7 +1894,8 @@ class Tool(object):
     elif hasattr(self, 'git_branch'):
       success = git_clone_checkout_and_pull(url, self.installation_path(), self.git_branch)
     elif url.endswith(ARCHIVE_SUFFIXES):
-      success = download_and_unzip(url, self.installation_path(), filename_prefix=getattr(self, 'zipfile_prefix', ''))
+      success = download_and_extract(url, self.installation_path(),
+                                     filename_prefix=getattr(self, 'download_prefix', ''))
     else:
       assert False, 'unhandled url type: ' + url
 
@@ -2052,8 +1907,8 @@ class Tool(object):
         success = emscripten_post_install(self)
       elif self.custom_install_script == 'emscripten_npm_install':
         success = emscripten_npm_install(self, self.installation_path())
-      elif self.custom_install_script in ('build_fastcomp', 'build_llvm', 'build_ninja', 'build_ccache'):
-        # 'build_fastcomp' is a special one that does the download on its
+      elif self.custom_install_script in ('build_llvm', 'build_ninja', 'build_ccache'):
+        # 'build_llvm' is a special one that does the download on its
         # own, others do the download manually.
         pass
       elif self.custom_install_script == 'build_binaryen':
@@ -2090,8 +1945,8 @@ class Tool(object):
       return
     url = self.download_url()
     if url.endswith(ARCHIVE_SUFFIXES):
-      download_target = get_download_target(url, zips_subdir, getattr(self, 'zipfile_prefix', ''))
-      debug_print("Deleting temporary zip file " + download_target)
+      download_target = get_download_target(url, download_dir, getattr(self, 'download_prefix', ''))
+      debug_print("Deleting temporary download: " + download_target)
       rmfile(download_target)
 
   def uninstall(self):
@@ -2186,8 +2041,8 @@ def find_latest_hash():
 
 def resolve_sdk_aliases(name, verbose=False):
   releases_info = load_releases_info()
-  if name == 'latest' and LINUX and ARCH == 'aarch64':
-    print("warning: 'latest' on arm64-linux may be slightly behind other architectures")
+  if name == 'latest' and LINUX and ARCH == 'arm64':
+    errlog("WARNING: 'latest' on arm64-linux may be slightly behind other architectures")
     name = 'latest-arm64-linux'
   while name in releases_info['aliases']:
     if verbose:
@@ -2196,15 +2051,15 @@ def resolve_sdk_aliases(name, verbose=False):
   return name
 
 
-def find_latest_sdk(which):
-  return 'sdk-releases-%s-%s-64bit' % (which, find_latest_hash())
+def find_latest_sdk():
+  return 'sdk-releases-%s-64bit' % (find_latest_hash())
 
 
 def find_tot_sdk():
   debug_print('Fetching emscripten-releases repository...')
   global extra_release_tag
   extra_release_tag = get_emscripten_releases_tot()
-  return 'sdk-releases-upstream-%s-64bit' % (extra_release_tag)
+  return 'sdk-releases-%s-64bit' % (extra_release_tag)
 
 
 def parse_emscripten_version(emscripten_root):
@@ -2234,19 +2089,31 @@ def get_emscripten_releases_tot():
   # may not be a build for the most recent ones yet; find the last
   # that does.
   arch = ''
-  if ARCH == 'aarch64':
+  if ARCH == 'arm64':
     arch = '-arm64'
-  for release in recent_releases:
-    url = emscripten_releases_download_url_template % (
+
+  def make_url(ext):
+   return emscripten_releases_download_url_template % (
       os_name(),
       release,
       arch,
-      'tbz2' if not WINDOWS else 'zip'
+      ext,
     )
+
+  for release in recent_releases:
+    make_url('tar.xz' if not WINDOWS else 'zip')
     try:
-      urlopen(url)
+      urlopen(make_url('tar.xz' if not WINDOWS else 'zip'))
     except:
-      continue
+      if not WINDOWS:
+        # Try the old `.tbz2` name
+        # TODO:remove this once tot builds are all using xz
+        try:
+          urlopen(make_url('tbz2'))
+        except:
+          continue
+      else:
+        continue
     return release
   exit_with_error('failed to find build of any recent emsdk revision')
 
@@ -2269,14 +2136,14 @@ def python_2_3_sorted(arr, cmp):
 
 
 def is_emsdk_sourced_from_github():
-  return os.path.exists(os.path.join(emsdk_path(), '.git'))
+  return os.path.exists(os.path.join(EMSDK_PATH, '.git'))
 
 
 def update_emsdk():
   if is_emsdk_sourced_from_github():
     errlog('You seem to have bootstrapped Emscripten SDK by cloning from GitHub. In this case, use "git pull" instead of "emsdk update" to update emsdk. (Not doing that automatically in case you have local changes)')
     sys.exit(1)
-  if not download_and_unzip(emsdk_zip_download_url, emsdk_path(), clobber=False):
+  if not download_and_extract(emsdk_zip_download_url, EMSDK_PATH, clobber=False):
     sys.exit(1)
 
 
@@ -2334,31 +2201,28 @@ def get_installed_sdk_version():
     return None
   with open(version_file) as f:
     version = f.read()
-  return version.split('-')[2]
+  return version.split('-')[1]
 
 
 # Get a list of tags for emscripten-releases.
 def load_releases_tags():
   tags = []
-  tags_fastcomp = []
   info = load_releases_info()
 
   for version, sha in sorted(info['releases'].items(), key=lambda x: version_key(x[0])):
     tags.append(sha)
-    # Only include versions older than 1.39.0 in fastcomp releases
-    if version_key(version) < (2, 0, 0):
-      tags_fastcomp.append(sha)
 
   if extra_release_tag:
     tags.append(extra_release_tag)
 
   # Explicitly add the currently installed SDK version.  This could be a custom
-  # version (installed explicitly) so it might not be part of the main list loaded above.
+  # version (installed explicitly) so it might not be part of the main list
+  # loaded above.
   installed = get_installed_sdk_version()
   if installed and installed not in tags:
     tags.append(installed)
 
-  return tags, tags_fastcomp
+  return tags
 
 
 def load_releases_versions():
@@ -2386,7 +2250,7 @@ def load_sdk_manifest():
   llvm_precompiled_tags_64bit = load_file_index_list('llvm-tags-64bit.txt')
   llvm_precompiled_tags = llvm_precompiled_tags_32bit + llvm_precompiled_tags_64bit
   binaryen_tags = load_legacy_binaryen_tags()
-  releases_tags, releases_tags_fastcomp = load_releases_tags()
+  releases_tags = load_releases_tags()
 
   def dependencies_exist(sdk):
     for tool_name in sdk.uses:
@@ -2470,8 +2334,6 @@ def load_sdk_manifest():
         expand_category_param('%precompiled_tag64%', llvm_precompiled_tags_64bit, t, is_sdk=False)
       elif '%binaryen_tag%' in t.version:
         expand_category_param('%binaryen_tag%', binaryen_tags, t, is_sdk=False)
-      elif '%releases-tag%' in t.version and 'fastcomp' in t.version:
-        expand_category_param('%releases-tag%', releases_tags_fastcomp, t, is_sdk=False)
       elif '%releases-tag%' in t.version:
         expand_category_param('%releases-tag%', releases_tags, t, is_sdk=False)
       else:
@@ -2492,8 +2354,6 @@ def load_sdk_manifest():
         expand_category_param('%precompiled_tag32%', llvm_precompiled_tags_32bit, sdk, is_sdk=True)
       elif '%precompiled_tag64%' in sdk.version:
         expand_category_param('%precompiled_tag64%', llvm_precompiled_tags_64bit, sdk, is_sdk=True)
-      elif '%releases-tag%' in sdk.version and 'fastcomp' in sdk.version:
-        expand_category_param('%releases-tag%', releases_tags_fastcomp, sdk, is_sdk=True)
       elif '%releases-tag%' in sdk.version:
         expand_category_param('%releases-tag%', releases_tags, sdk, is_sdk=True)
       else:
@@ -2538,7 +2398,7 @@ def process_tool_list(tools_to_activate):
 
 
 def write_set_env_script(env_string):
-  assert(CMD or POWERSHELL)
+  assert CMD or POWERSHELL
   open(EMSDK_SET_ENV, 'w').write(env_string)
 
 
@@ -2553,7 +2413,7 @@ def set_active_tools(tools_to_activate, permanently_activate, system):
     print('Setting the following tools as active:\n   ' + '\n   '.join(map(lambda x: str(x), tools)))
     print('')
 
-  generate_dot_emscripten(tools_to_activate)
+  generate_em_config(tools_to_activate)
 
   # Construct a .bat or .ps1 script that will be invoked to set env. vars and PATH
   # We only do this on cmd or powershell since emsdk.bat/ps1 is able to modify the
@@ -2621,12 +2481,11 @@ def adjusted_path(tools_to_activate, system=False, user=False):
     existing_path = win_get_environment_variable('PATH', system=system, user=user, fallback=True).split(ENVPATH_SEPARATOR)
   else:
     existing_path = os.environ['PATH'].split(ENVPATH_SEPARATOR)
-  emsdk_root_path = to_unix_path(emsdk_path())
 
   existing_emsdk_tools = []
   existing_nonemsdk_path = []
   for entry in existing_path:
-    if to_unix_path(entry).startswith(emsdk_root_path):
+    if to_unix_path(entry).startswith(EMSDK_PATH):
       existing_emsdk_tools.append(entry)
     else:
       existing_nonemsdk_path.append(entry)
@@ -2663,14 +2522,13 @@ def get_env_vars_to_add(tools_to_activate, system, user):
     env_vars_to_add += [('PATH', newpath)]
 
     if added_path:
-      errlog('Adding directories to PATH:')
+      info('Adding directories to PATH:')
       for item in added_path:
-        errlog('PATH += ' + item)
-      errlog('')
+        info('PATH += ' + item)
+      info('')
 
   # A core variable EMSDK points to the root of Emscripten SDK directory.
-  env_vars_to_add += [('EMSDK', to_unix_path(emsdk_path()))]
-  env_vars_to_add += [('EM_CONFIG', os.path.normpath(dot_emscripten_path()))]
+  env_vars_to_add += [('EMSDK', EMSDK_PATH)]
 
   for tool in tools_to_activate:
     config = tool.activated_config()
@@ -2686,6 +2544,9 @@ def get_env_vars_to_add(tools_to_activate, system, user):
       #   https://github.com/emscripten-core/emscripten/pull/11091
       # - Default to embedded cache also started in 1.39.16
       #   https://github.com/emscripten-core/emscripten/pull/11126
+      # - Emscripten supports automatically locating the embedded
+      #   config in 1.39.13:
+      #   https://github.com/emscripten-core/emscripten/pull/10935
       #
       # Since setting EM_CACHE in the environment effects the entire machine
       # we want to avoid this except when installing these older emscripten
@@ -2694,6 +2555,8 @@ def get_env_vars_to_add(tools_to_activate, system, user):
       if version < [1, 39, 16]:
         em_cache_dir = os.path.join(config['EMSCRIPTEN_ROOT'], 'cache')
         env_vars_to_add += [('EM_CACHE', em_cache_dir)]
+      if version < [1, 39, 13]:
+        env_vars_to_add += [('EM_CONFIG', os.path.normpath(EM_CONFIG_PATH))]
 
     envs = tool.activated_environment()
     for env in envs:
@@ -2705,6 +2568,7 @@ def get_env_vars_to_add(tools_to_activate, system, user):
 
 
 def construct_env(tools_to_activate, system, user):
+  info('Setting up EMSDK environment (suppress these messages with EMSDK_QUIET=1)')
   return construct_env_with_vars(get_env_vars_to_add(tools_to_activate, system, user))
 
 
@@ -2723,13 +2587,13 @@ def unset_env(key):
 def construct_env_with_vars(env_vars_to_add):
   env_string = ''
   if env_vars_to_add:
-    errlog('Setting environment variables:')
+    info('Setting environment variables:')
 
     for key, value in env_vars_to_add:
       # Don't set env vars which are already set to the correct value.
       if key in os.environ and to_unix_path(os.environ[key]) == to_unix_path(value):
         continue
-      errlog(key + ' = ' + value)
+      info(key + ' = ' + value)
       if POWERSHELL:
         env_string += '$env:' + key + '="' + value + '"\n'
       elif CMD:
@@ -2757,9 +2621,9 @@ def construct_env_with_vars(env_vars_to_add):
                      'EMSDK_NUM_CORES', 'EMSDK_NOTTY', 'EMSDK_KEEP_DOWNLOADS'])
   env_keys_to_add = set(pair[0] for pair in env_vars_to_add)
   for key in os.environ:
-    if key.startswith('EMSDK_') or key.startswith('EM_'):
+    if key.startswith('EMSDK_') or key in ('EM_CACHE', 'EM_CONFIG'):
       if key not in env_keys_to_add and key not in ignore_keys:
-        errlog('Clearing existing environment variable: %s' % key)
+        info('Clearing existing environment variable: %s' % key)
         env_string += unset_env(key)
 
   return env_string
@@ -2772,16 +2636,12 @@ def error_on_missing_tool(name):
     exit_with_error("tool or SDK not found: '%s'" % name)
 
 
-def exit_with_fastcomp_error():
-    exit_with_error('the fastcomp backend is not getting new builds or releases. Please use the upstream llvm backend or use an older version than 2.0.0 (such as 1.40.1).')
-
-
 def expand_sdk_name(name, activating):
   if 'upstream-master' in name:
-    errlog('upstream-master SDK has been renamed upstream-main')
-    name = name.replace('upstream-master', 'upstream-main')
-  if name in ('latest-fastcomp', 'latest-releases-fastcomp', 'tot-fastcomp', 'sdk-nightly-latest'):
-    exit_with_fastcomp_error()
+    errlog('upstream-master SDK has been renamed main')
+    name = name.replace('upstream-master', 'main')
+  if 'fastcomp' in name:
+    exit_with_error('the fastcomp backend is no longer supported.  Please use an older version of emsdk (for example 3.1.29) if you want to install the old fastcomp-based SDK')
   if name in ('tot', 'sdk-tot', 'tot-upstream'):
     if activating:
       # When we are activating a tot release, assume that the currently
@@ -2791,47 +2651,34 @@ def expand_sdk_name(name, activating):
       installed = get_installed_sdk_version()
       if installed:
         debug_print('activating currently installed SDK; not updating tot version')
-        return 'sdk-releases-upstream-%s-64bit' % installed
-    return str(find_tot_sdk())
+        return 'sdk-releases-%s-64bit' % installed
+    return find_tot_sdk()
+
+  if '-upstream' in name:
+    name = name.replace('-upstream', '')
 
   name = resolve_sdk_aliases(name, verbose=True)
 
   # check if it's a release handled by an emscripten-releases version,
   # and if so use that by using the right hash. we support a few notations,
-  #   x.y.z[-(upstream|fastcomp_])
-  #   sdk-x.y.z[-(upstream|fastcomp_])-64bit
+  #   x.y.z
+  #   sdk-x.y.z-64bit
   # TODO: support short notation for old builds too?
-  backend = None
   fullname = name
-  if '-upstream' in fullname:
-    fullname = name.replace('-upstream', '')
-    backend = 'upstream'
-  elif '-fastcomp' in fullname:
-    fullname = fullname.replace('-fastcomp', '')
-    backend = 'fastcomp'
   version = fullname.replace('sdk-', '').replace('releases-', '').replace('-64bit', '').replace('tag-', '')
   sdk = 'sdk-' if not name.startswith('releases-') else ''
   releases_info = load_releases_info()['releases']
   release_hash = get_release_hash(version, releases_info)
   if release_hash:
     # Known release hash
-    if backend == 'fastcomp' and version_key(version) >= (2, 0, 0):
-      exit_with_fastcomp_error()
-    if backend is None:
-      if version_key(version) >= (1, 39, 0):
-        backend = 'upstream'
-      else:
-        backend = 'fastcomp'
-    full_name = '%sreleases-%s-%s-64bit' % (sdk, backend, release_hash)
+    full_name = '%sreleases-%s-64bit' % (sdk, release_hash)
     print("Resolving SDK version '%s' to '%s'" % (version, full_name))
     return full_name
 
   if len(version) == 40:
-    if backend is None:
-      backend = 'upstream'
     global extra_release_tag
     extra_release_tag = version
-    return '%sreleases-%s-%s-64bit' % (sdk, backend, version)
+    return '%sreleases-%s-64bit' % (sdk, version)
 
   return name
 
@@ -2899,7 +2746,7 @@ def main(args):
                                   purposes. Default: Enabled
             --disable-assertions: Forces assertions off during the build.
 
-               --vs2017/--vs2019: If building from source, overrides to build
+               --vs2019/--vs2022: If building from source, overrides to build
                                   using the specified compiler. When installing
                                   precompiled packages, this has no effect.
                                   Note: The same compiler specifier must be
@@ -2922,7 +2769,7 @@ def main(args):
 
     if WINDOWS:
       print('''
-   emsdk activate [--permanent] [--system] [--build=type] [--vs2017/--vs2019] <tool/sdk>
+   emsdk activate [--permanent] [--system] [--build=type] [--vs2019/--vs2022] <tool/sdk>
 
                                 - Activates the given tool or SDK in the
                                   environment of the current shell.
@@ -2936,8 +2783,8 @@ def main(args):
                                   (uses Machine environment variables).
 
                                 - If a custom compiler version was used to override
-                                  the compiler to use, pass the same --vs2017/--vs2019 parameter
-                                  here to choose which version to activate.
+                                  the compiler to use, pass the same --vs2019/--vs2022
+                                  parameter here to choose which version to activate.
 
    emcmdprompt.bat              - Spawns a new command prompt window with the
                                   Emscripten environment active.''')
@@ -3006,7 +2853,7 @@ def main(args):
     activating = cmd == 'activate'
     args = [expand_sdk_name(a, activating=activating) for a in args]
 
-  load_dot_emscripten()
+  load_em_config()
   load_sdk_manifest()
 
   # Apply any overrides to git branch names to clone from.
@@ -3062,13 +2909,11 @@ def main(args):
     if (LINUX or MACOS or WINDOWS) and (ARCH == 'x86' or ARCH == 'x86_64'):
       print('The *recommended* precompiled SDK download is %s (%s).' % (find_latest_version(), find_latest_hash()))
       print()
-      print('To install/activate it, use one of:')
-      print('         latest                  [default (llvm) backend]')
-      print('         latest-fastcomp         [legacy (fastcomp) backend]')
+      print('To install/activate it use:')
+      print('         latest')
       print('')
-      print('Those are equivalent to installing/activating the following:')
-      print('         %s             %s' % (find_latest_version(), installed_sdk_text(find_latest_sdk('upstream'))))
-      print('         %s-fastcomp    %s' % (find_latest_version(), installed_sdk_text(find_latest_sdk('fastcomp'))))
+      print('This is equivalent to installing/activating:')
+      print('         %s             %s' % (find_latest_version(), installed_sdk_text(find_latest_sdk())))
       print('')
     else:
       print('Warning: your platform does not have precompiled SDKs available.')
@@ -3076,14 +2921,10 @@ def main(args):
       print('')
 
     print('All recent (non-legacy) installable versions are:')
-    releases_versions = sorted(
-      load_releases_versions(),
-      key=lambda x: [int(v) if v.isdigit() else -1 for v in x.split('.')],
-      reverse=True,
-    )
+    releases_versions = sorted(load_releases_versions(), key=version_key, reverse=True)
     releases_info = load_releases_info()['releases']
     for ver in releases_versions:
-      print('         %s    %s' % (ver, installed_sdk_text('sdk-releases-upstream-%s-64bit' % get_release_hash(ver, releases_info))))
+      print('         %s    %s' % (ver, installed_sdk_text('sdk-releases-%s-64bit' % get_release_hash(ver, releases_info))))
     print()
 
     # Use array to work around the lack of being able to mutate from enclosing
@@ -3246,6 +3087,10 @@ def main(args):
     if not args:
       errlog("Missing parameter. Type 'emsdk install <tool name>' to install a tool or an SDK. Type 'emsdk list' to obtain a list of available tools. Type 'emsdk install latest' to automatically install the newest version of the SDK.")
       return 1
+
+    if LINUX and ARCH == 'arm64' and args != ['latest']:
+      errlog('WARNING: arm64-linux binaries are not available for all releases.')
+      errlog('See https://github.com/emscripten-core/emsdk/issues/547')
 
     for t in args:
       tool = find_tool(t)
